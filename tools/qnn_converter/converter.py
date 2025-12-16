@@ -88,11 +88,12 @@ def main(args):
         """
         run_shell_command(generate_so_command)
 
-        if args.clear_build_files:
-            rm_command = f"rm -rf {args.build_folder}/m*/batch_{i}/data&&rm -rf {args.build_folder}/m*/batch_{i}/onnx_model"
-            run_shell_command(rm_command)
+        # if args.clear_build_files:
+        #     rm_command = f"rm -rf {args.build_folder}/m*/batch_{i}/data&&rm -rf {args.build_folder}/m*/batch_{i}/onnx_model"
+        #     run_shell_command(rm_command)
 
     get_config_file(args.build_folder, args.batch_sizes)
+    
     generate_binary_command = f"""
         python build_all_layers.py \
             {'--silent' if args.silent else ''} \
