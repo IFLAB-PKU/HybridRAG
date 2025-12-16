@@ -215,6 +215,8 @@ class LlamaAttention(nn.Module):
         rms_norm_eps: float,
         fp16_head_ids: list[int],
         device: torch.device,
+        model_name: str,  # lsh 修改
+        head_dim: str # lsh 修改
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -223,13 +225,23 @@ class LlamaAttention(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.has_qkv_bias = has_qkv_bias
         self.device = device
+        self.model_name = model_name
+        self.head_dim = head_dim
+
+        ### lsh 修改
+        self.q_norm = None
+        self.k_norm = None
+        if "qwen3" in self.model_name:
+            self.q_norm = LlamaRMSNorm(embed_dim=self.head_dim, eps=rms_norm_eps, device=device)  # Initialize q_norm
+            self.k_norm = LlamaRMSNorm(embed_dim=self.head_dim, eps=rms_norm_eps, device=device)  # Initialize k_norm
+        ### lsh 修改结束
 
         self.fp16_head_ids = sorted(fp16_head_ids)
         self.int4_head_ids = sorted(set(range(n_heads)).difference(fp16_head_ids))
 
         assert embed_dim % n_heads == 0
         assert n_heads % n_kv_heads == 0
-        self.head_dim = embed_dim // n_heads
+        # self.head_dim = embed_dim // n_heads # 这个必须注释掉哇！前面已经定义了“直传”的self.head_dim了
         self.group_size = n_heads // n_kv_heads
 
         self.norm = LlamaRMSNorm(embed_dim=embed_dim, eps=rms_norm_eps, device=device)
@@ -297,10 +309,21 @@ class LlamaAttention(nn.Module):
         loader.load(self.norm, f"model.layers.{self.layer_id}.input_layernorm.weight")
 
         wq = torch.empty(self.embed_dim, self.embed_dim, dtype=torch.float32, device=self.device)
+        ### lsh 修改
+        if "qwen3" in self.model_name:
+            wq = torch.empty(2*self.embed_dim, self.embed_dim, dtype=torch.float32, device=self.device)
+        ###
         loader.load(wq, f"model.layers.{self.layer_id}.self_attn.q_proj.weight")
+        
         if self.has_qkv_bias:
             bq = torch.empty(self.embed_dim, dtype=torch.float32, device=self.device)
             loader.load(bq, f"model.layers.{self.layer_id}.self_attn.q_proj.bias")
+
+        ### lsh 修改
+        if self.q_norm is not None and self.k_norm is not None:
+            loader.load(self.q_norm, f"model.layers.{self.layer_id}.self_attn.q_norm.weight")
+            loader.load(self.k_norm, f"model.layers.{self.layer_id}.self_attn.k_norm.weight")
+        ###
 
         for i in range(self.n_heads):
             self.q_heads[i].weight.data.copy_(wq[i * self.head_dim : (i + 1) * self.head_dim, :])
@@ -308,6 +331,7 @@ class LlamaAttention(nn.Module):
                 self.q_heads[i].bias.data.copy_(bq[i * self.head_dim : (i + 1) * self.head_dim])
 
         wk = torch.empty(self.head_dim * self.n_kv_heads, self.embed_dim, dtype=torch.float32, device=self.device)
+        
         loader.load(wk, f"model.layers.{self.layer_id}.self_attn.k_proj.weight")
         if self.has_qkv_bias:
             bk = torch.empty(self.head_dim * self.n_kv_heads, dtype=torch.float32, device=self.device)
@@ -330,6 +354,10 @@ class LlamaAttention(nn.Module):
                 self.v_heads[i].bias.data.copy_(bv[i * self.head_dim : (i + 1) * self.head_dim])
 
         wo = torch.empty(self.embed_dim, self.embed_dim, dtype=torch.float32, device=self.device)
+        ### lsh 修改
+        if "qwen3" in self.model_name:
+            wo = torch.empty(self.embed_dim, 2*self.embed_dim, dtype=torch.float32, device=self.device)
+        ###
         loader.load(wo, f"model.layers.{self.layer_id}.self_attn.o_proj.weight")
         o_heads = wo.reshape(self.embed_dim, self.n_heads, self.head_dim)
         if len(self.fp16_head_ids) > 0:
@@ -348,8 +376,20 @@ class LlamaAttention(nn.Module):
         """Returns the attention output, keys and values of input x"""
 
         attn_input = self.norm(x)
-        queries = [self.rope(q_head(attn_input), rope_embeds) for q_head in self.q_heads]
-        keys = [self.rope(k_head(attn_input), rope_embeds) for k_head in self.k_heads]
+
+       
+
+        ### lsh 修改 
+        # 这里怪的很，注释掉就不报错，不注释掉就报
+        # [ ERROR ] QnnModel::addNode() validating node rms_norm_2 failed.[ ERROR ] model.addNode(..., "RmsNorm", ...) ... got MODEL_GRAPH_OP_VALIDATION_ERROR
+        if self.q_norm is not None and self.k_norm is not None:
+            # Qwen3 逻辑: 投影 -> Norm -> RoPE
+            queries = [self.rope(self.q_norm(q_head(attn_input)), rope_embeds) for q_head in self.q_heads]
+            keys = [self.rope(self.k_norm(k_head(attn_input)), rope_embeds) for k_head in self.k_heads]
+        else:
+            queries = [self.rope(q_head(attn_input), rope_embeds) for q_head in self.q_heads]
+            keys = [self.rope(k_head(attn_input), rope_embeds) for k_head in self.k_heads]
+ 
         values = [v_head(attn_input) for v_head in self.v_heads]
 
         head_outs, scaled_keys, scaled_values = self.core(
@@ -513,6 +553,9 @@ class LlamaTransformer(nn.Module):
         fp16_head_ids: list[int],
         fp16_neuron_ids: list[int],
         device: torch.device,
+        model_name: str,
+        head_dim: int, # lsh 新增
+        
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -526,7 +569,9 @@ class LlamaTransformer(nn.Module):
             has_qkv_bias=has_qkv_bias,
             rms_norm_eps=rms_norm_eps,
             fp16_head_ids=fp16_head_ids,
-            device=device,
+            device=device,        
+            model_name=model_name, # lsh 新增
+            head_dim=head_dim,  # lsh 新增
         )
         self.ffn = LlamaFeedForward(
             layer_id=layer_id,
