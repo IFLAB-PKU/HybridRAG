@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "graph/graph.hpp"
-#include <iostream>
 
 namespace powerserve {
 
@@ -79,7 +78,6 @@ auto Graph::mat_mul(TensorNode *a, TensorNode *b) -> TensorNode * {
 auto Graph::rms_norm(TensorNode *x, TensorNode *weight, float eps) -> TensorNode * {
     POWERSERVE_ASSERT(weight->n_dims() == 1);
     POWERSERVE_ASSERT(x->m_dtype == weight->m_dtype);
-    // std::cout << "RMS Norm: x_shape=" << x->m_shape[0] << ", weight_shape=" << weight->m_shape[0] << std::endl;
     POWERSERVE_ASSERT(x->m_shape[0] == weight->m_shape[0]);
 
     auto out = dup_tensor(x);
