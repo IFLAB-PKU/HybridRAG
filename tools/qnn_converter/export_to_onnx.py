@@ -885,12 +885,12 @@ class ModelChunkExporter:
         # 它们处于 FP16 的计算环境中
         for node in graph.initializer:
             if match(node, "layers\.[0-9]+\.attn\.(q|k)_norm\.weight"):
-                print(f"INFO: Overriding Q/K norm param {node.name} to 16-bit float.")
+                # print(f"INFO: Overriding Q/K norm param {node.name} to 16-bit float.")
                 encode_param(node, 16, "float")
         for node in graph.node:
             # 注意这里的匹配规则，更精确地匹配 q_norm 和 k_norm 的节点
             if "/attn/q_norm" in node.name or "/attn/k_norm" in node.name:
-                print(f"INFO: Overriding Q/K norm output of {node.name} to 16-bit float.")
+                # print(f"INFO: Overriding Q/K norm output of {node.name} to 16-bit float.")
                 encode_output(node, 16)
 
         
