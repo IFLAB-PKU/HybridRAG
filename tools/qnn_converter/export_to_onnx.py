@@ -174,9 +174,13 @@ class LlamaModelChunk(ExportableModule, KVCache):
         n_fp16_heads: int | dict[int, int],
         n_fp16_neurons: int | dict[int, int],
         stat_folder: Path,
+        model_name: str,  # lsh 添加
+        head_dim: int   # lsh 添加
     ):
         super().__init__("transformers", start_layer_id, end_layer_id)
         self.n_kv_heads = n_kv_heads
+        self.model_name = model_name
+        self.head_dim=head_dim
 
         self.layers = nn.ModuleList()
         for layer_id in range(start_layer_id, end_layer_id):
@@ -218,6 +222,8 @@ class LlamaModelChunk(ExportableModule, KVCache):
                     fp16_head_ids=attn_head_ids,
                     fp16_neuron_ids=ffn_neuron_ids,
                     device=device,
+                    model_name=self.model_name,  # lsh 添加
+                    head_dim=head_dim 
                 )
             )
 
@@ -225,7 +231,8 @@ class LlamaModelChunk(ExportableModule, KVCache):
             start_layer_id=start_layer_id,
             end_layer_id=end_layer_id,
             n_kv_heads=n_kv_heads,
-            head_dim=(embed_dim // n_heads),
+            # head_dim=(embed_dim // n_heads),
+            head_dim=head_dim, # passed correctly
             cache_size=cache_size,
         )
 
@@ -343,7 +350,7 @@ class LlamaModel(nn.Module):
         model_folder: Path,
         model_params: ModelParams,
         graph_params: GraphParams,
-        model_chunks: List[ExportableModule],
+        model_chunks: List[ExportableModule]
     ) -> None:
         super().__init__()
         self.model_folder = model_folder
@@ -490,7 +497,7 @@ class LlamaModel(nn.Module):
 
     def reset(self):
         self.first_prompt = self.system_prompt_length == 0
-        self.last_logits = None
+        self.last_logits = Nonef
         self.logits = []
 
         for model_chunk in self.model_chunks:
@@ -771,6 +778,14 @@ class ModelChunkExporter:
         export_json(io_spec, self.output_folder / f"{self.graph_name}.io.json")
 
     def export_quantization_config(self):
+        # --- DEBUG: Print all initializer names ---
+        # print("="*50)
+        # print(f"DEBUG: Initializers for graph {self.graph_name}:")
+        # for node in self.onnx_model.graph.initializer:
+        #     print(f"  - {node.name}")
+        # print("="*50)
+
+
         class Encoding(NamedTuple):
             category: Literal["activation", "param"]
             bitwidth: int
@@ -857,12 +872,28 @@ class ModelChunkExporter:
                 encode_output(node, 32)
 
         # RMSNorm: FP32
+        # (原有的规则)
         for node in graph.initializer:
             if match(node, "layers\.[0-9]+\.(attn|ffn)\.norm\.weight"):
                 encode_param(node, 32, "float")
         for node in graph.node:
             if match(node, "/layers\.[0-9]+/(attn|ffn)/norm.*"):
                 encode_output(node, 32)
+
+
+        # 新规则 : Attention 核心内部的 q_norm 和 k_norm，使用 FP16 以追求性能
+        # 它们处于 FP16 的计算环境中
+        for node in graph.initializer:
+            if match(node, "layers\.[0-9]+\.attn\.(q|k)_norm\.weight"):
+                # print(f"INFO: Overriding Q/K norm param {node.name} to 16-bit float.")
+                encode_param(node, 16, "float")
+        for node in graph.node:
+            # 注意这里的匹配规则，更精确地匹配 q_norm 和 k_norm 的节点
+            if "/attn/q_norm" in node.name or "/attn/k_norm" in node.name:
+                # print(f"INFO: Overriding Q/K norm output of {node.name} to 16-bit float.")
+                encode_output(node, 16)
+
+        
 
         # FP16 components
         for node in graph.initializer:
@@ -961,13 +992,19 @@ model_chunks = [
         n_fp16_heads=model_params.n_fp16_heads,
         n_fp16_neurons=model_params.n_fp16_neurons,
         stat_folder=args.model_folder / "stat",
+        model_name=args.model_name, # lsh 添加
+        head_dim=model_params.head_dim, # lsh 添加
+        
     )
     for i in range(0, model_params.n_layers, n_layers_per_model_chunk)
 ]
 
 
 model = LlamaModel(
-    model_folder=args.model_folder, model_params=model_params, graph_params=graph_params, model_chunks=model_chunks
+    model_folder=args.model_folder, 
+    model_params=model_params, 
+    graph_params=graph_params, 
+    model_chunks=model_chunks,
 )
 
 print("Loading model weights...")

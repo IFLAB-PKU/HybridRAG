@@ -222,6 +222,38 @@ class Qwen2_5_500M_Spinquant_Params(ModelParams):
     n_fp16_heads = 0
     n_fp16_neurons = 0
 
+# 新加入Qwen3
+class Qwen3_0_6B_Base_Params(ModelParams):
+    # Qwen3 移除了 QKV 偏置项，这是与 Qwen2.5 的一个核心区别
+    has_qkv_bias = False
+    use_drelu = False
+    tie_embedding = True
+
+    # 模型尺寸参数
+    n_layers = 28
+    vocab_size = 151936
+    ffn_hidden_dim = 3072  # intermediate_size
+    head_dim = 128         # attention.key_length
+    n_heads = 16           # attention.head_count
+    n_kv_heads = 8         # attention.head_count_kv
+
+    # 新增
+    embed_dim = 1024
+
+    # RoPE 和 Norm 参数
+    rope_theta = 1e6
+    rms_norm_eps = 1e-6
+    attention_mask_value = -5e4 # 保持与 Qwen2.5 一致，或根据需要调整
+
+    # FP16 相关配置，暂时保持默认关闭状态
+    # 后续可以根据性能分析和精度要求进行调整
+    fp16_attention_layers = []
+    fp16_ffn_layers = []
+    fp16_rope = True
+    fp16_qkv_heads = True
+    n_fp16_heads = 0
+    n_fp16_neurons = 0
+# Qwen3 已加入
 
 class SmallThinker_3B_Params(ModelParams):
     has_qkv_bias = True
@@ -329,6 +361,7 @@ model_map: dict[str, ModelParams] = {
     "qwen2.5_7b_spin": Qwen2_5_7B_Spinquant_Params,
     "qwen2.5_0.5b": Qwen2_5_500M_Params,
     "qwen2.5_0.5b_spin": Qwen2_5_500M_Spinquant_Params,
+    "qwen3_0.6b_base": Qwen3_0_6B_Base_Params,
     "llama3_1_8b": Llama3_1_8B_Params,
     "llama3_2_1b": Llama3_2_1B_Params,
     "llama2_7b": Llama2_7B_Params,
