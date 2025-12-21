@@ -736,6 +736,11 @@ inline ModelOutput blocking_embedding(
      */
     Timer timer;
     std::vector<powerserve::Token> tokens = tokenizer.tokenize(input_prompt, tokenizer.m_vocab.tokenizer_add_bos);
+    // [FIX] Manually add EOS Token for embedding (Required by Qwen3)
+    // see https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/tree/main?show_file_info=Qwen3-Embedding-0.6B-Q8_0.gguf
+    powerserve::Token eos_token = 151643; 
+    // TODO: Remove hard code and make it configurable
+    tokens.push_back(eos_token);
     const size_t num_tokens = tokens.size();
 
     std::vector<float> embedding_vector;

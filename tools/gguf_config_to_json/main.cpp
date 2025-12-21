@@ -63,6 +63,8 @@ rope_type get_rope_type(std::string arch) {
         return rope_type::NORMAL;
     } else if (arch == "qwen" || arch == "phi3") {
         return rope_type::NEOX;
+    } else if (arch == "qwen2" || arch == "qwen3") { // lsh added
+        return rope_type::NEOX;
     }
     return rope_type::NONE;
 }
@@ -113,6 +115,10 @@ void collect_config(gguf_context *ctx, nlohmann::json &config) {
         config["n_ctx"]           = get_u32(ctx, get_arch_config("{}.context_length"));
         config["head_size"]       = (uint32_t)config["embed_dim"] / (uint32_t)config["n_attn_heads"];
         config["kv_dim"]          = (uint32_t)config["head_size"] * (uint32_t)config["n_attn_kv_heads"];
+
+        // [FIX] read `key_length` as head_dim if exists
+        auto key_length_idx = gguf_find_key(ctx, get_arch_config("{}.attention.key_length").c_str());
+        if (key_length_idx != -1) config["head_size"] = gguf_get_val_u32(ctx, key_length_idx);
     }
     { // vocab_size
         auto idx = gguf_find_key(ctx, get_arch_config("{}.vocab_size").c_str());
