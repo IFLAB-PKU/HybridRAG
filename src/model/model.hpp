@@ -39,6 +39,24 @@ struct LogitsVector {
     }
 };
 
+// [NEW], in fact a renamed version of LogitsVector
+struct EmbeddingVector {
+    BufferPtr buffer;
+    std::vector<std::span<const float>> embeddings;
+
+    EmbeddingVector() = default;
+
+    // dim: embedding_dim
+    // batch_size: current_bs
+    EmbeddingVector(BufferPtr buffer, size_t dim, size_t batch_size) : buffer(buffer) {
+        float *data_ptr = static_cast<float *>(dynamic_cast<CPUBuffer &>(*buffer).m_data);
+        for (size_t i = 0; i < batch_size; i++) {
+            embeddings.push_back(std::span<const float>(data_ptr, data_ptr + dim));
+            data_ptr += dim;
+        }
+    }
+};
+
 struct TokenIterator {
     size_t n_rest              = 0;
     std::string m_prompt       = "";
@@ -103,6 +121,15 @@ public:
         const CausalAttentionMask &mask,
         bool lm_head = true
     ) -> LogitsVector = 0;
+
+    virtual auto compute_embedding(const std::vector<Token> &tokens, size_t batch_size) // supported by Qwen3-Embedding
+    -> std::vector<float> {
+        (void)tokens;     // unused
+        (void)batch_size; // unused
+        POWERSERVE_LOG_ERROR("compute_embedding is not implemented for this model.");
+        throw std::runtime_error("Embedding not supported");
+        return {};
+    };
 
 public:
     virtual auto decode(Sampler &sampler, const std::vector<Token> tokens, const std::vector<int> pos, bool lm_head)

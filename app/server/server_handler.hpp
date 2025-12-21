@@ -106,6 +106,7 @@ struct ModelInput {
 
 struct ModelOutput {
     std::string m_text;
+    std::vector<float> m_embedding; // lsh add for embedding
     size_t m_input_num_token;
     size_t m_output_num_token;
     std::optional<std::string> m_stop_reason;
@@ -715,6 +716,50 @@ inline ModelOutput blocking_inference(
     };
 }
 
+inline ModelOutput blocking_embedding(
+    const ModelContext &context, const ModelInput &input, const std::string &input_prompt
+) {
+    using namespace powerserve;
+
+    auto &config    = context.m_config;
+    auto &model     = *context.m_model_ptr;
+    auto &tokenizer = *context.m_tokenizer_ptr;
+
+    ModelOutput output;
+    const size_t batch_size = config.hyper_params.batch_size;
+
+    POWERSERVE_LOG_DEBUG("Model input     : {}", powerserve::abbreviation(input_prompt, 20));
+    POWERSERVE_LOG_DEBUG("Model batch size: {}", batch_size);
+
+    /*
+     * Embedding
+     */
+    Timer timer;
+    // [FIX] Use `tokenizer.m_vocab.tokenizer_add_eos` as 2nd param for `tokenize`
+    std::vector<powerserve::Token> tokens = tokenizer.tokenize(input_prompt, tokenizer.m_vocab.tokenizer_add_eos);
+    const size_t num_tokens = tokens.size();
+
+    std::vector<float> embedding_vector;
+    embedding_vector = model.compute_embedding(tokens, batch_size);
+
+    const size_t latency_ms = timer.elapsed_time_ms();
+    POWERSERVE_LOG_INFO(
+        "embedding tokens: {}, embedding time: {}ms",
+        num_tokens,
+        latency_ms
+    );
+
+    return {
+        .m_text             = "",
+        .m_embedding        = embedding_vector,
+        .m_input_num_token  = num_tokens,
+        .m_output_num_token = 0,
+        .m_stop_reason      = "stop"
+    };
+
+
+}
+
 /*!
  * @brief Generate
  * @param[inout] context
@@ -758,6 +803,14 @@ inline void chat(ServerContext &server_context, ServerSession &session) {
     const std::string input_prompt = tokenizer.apply_chat_template(input.m_history, true);
 
     stream_inference(context, session, input_prompt);
+}
+
+inline ModelOutput embedding(ServerContext &server_context, const ModelInput &input) {
+    using namespace powerserve;
+    /* Parse and concat user inputs */
+    const ModelContext &context = server_context.setup_model(input.m_model);
+    const std::string input_prompt = input.m_prompt;
+    return blocking_embedding(context, input, input_prompt);
 }
 
 inline std::vector<std::string> list_models(ServerContext &server_context) {
