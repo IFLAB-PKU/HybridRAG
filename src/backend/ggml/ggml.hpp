@@ -183,6 +183,7 @@ static void debug_system_info(void) {
 }
 
 // **Note**: Backend receives Tensor not TensorNode
+// **Note**: Backend receives Tensor not TensorNode
 struct GGMLBackend : Backend {
 public:
     op_compute_params m_params;
@@ -212,33 +213,36 @@ public:
     ~GGMLBackend() override = default;
 
 public:
-    // ggml wrapper ops
-    void add(const Tensor *dst, const Tensor *src0, const Tensor *src1) const;
-    void get_embedding(const Tensor *dst, const Tensor *weight, const std::vector<int> &tokens) const;
-    void matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const;
-    void rmsnorm(const Tensor *o, const Tensor *x, const Tensor *weight, float eps) const;
+    // --- Backend interface (add override) ---
+    void add(const Tensor *dst, const Tensor *src0, const Tensor *src1) const override;
+    void get_embedding(const Tensor *dst, const Tensor *weight, const std::vector<int> &tokens) const override;
+    void matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const override;
+    void rmsnorm(const Tensor *o, const Tensor *x, const Tensor *weight, float eps) const override;
     void rope(
         Tensor *out, const Tensor *src, const std::vector<int> &pos, const ModelConfig::LLMConfig::RopeConfig &rope_cfg
-    ) const;
-    void softmax(const Tensor *out, const Tensor *x) const;
-    void permute(const Tensor *out, const Tensor *x, Shape axes) const;
-    void cont(const Tensor *out, const Tensor *x) const;
-    void softmax_ext(const Tensor *out, const Tensor *x, const Tensor *mask, float scale, float max_bias) const;
+    ) const override;
+    void softmax(const Tensor *out, const Tensor *x) const override;
+    void print(const Tensor *x, size_t size) const override;
+    void permute(const Tensor *out, const Tensor *x, Shape axes) const override;
+    void cont(const Tensor *out, const Tensor *x) const override;
+    void softmax_ext(const Tensor *out, const Tensor *x, const Tensor *mask, float scale, float max_bias) const override;
 
+    void silu_hadamard(const Tensor *out, const Tensor *hb, const Tensor *hb2) const override;
+    void copy(const Tensor *dst, const Tensor *src) const override;
+    void reset_kv_batch_size(const size_t batch_size) const override;
+    void add_cache(const Tensor *k, const Tensor *v, size_t L, const std::vector<int> &pos, size_t head_id) override;
+    void transpose(const Tensor *out, const Tensor *x) const override;
+
+    void plan(std::vector<std::shared_ptr<OpNode>> &ops) override;
+
+public:
+    // --- helpers used by ggml implementation files (MUST keep declarations) ---
     bool is_contiguous(const Tensor *tensor, int n) const;
     int get_n_tasks(std::shared_ptr<OpNode> op);
     enum ggml_type get_vec_dot_type(const Tensor *tensor);
 
 public:
-    void silu_hadamard(const Tensor *out, const Tensor *hb, const Tensor *hb2) const;
-    void copy(const Tensor *dst, const Tensor *src) const;
-    void print(const Tensor *x, size_t size) const;
-    void reset_kv_batch_size(const size_t batch_size) const;
-    void add_cache(const Tensor *k, const Tensor *v, size_t L, const std::vector<int> &pos, size_t head_id);
-    void transpose(const Tensor *out, const Tensor *x) const;
-
-public:
-    void plan(std::vector<std::shared_ptr<OpNode>> &ops);
+    // --- other existing ggml utilities (keep if implemented in cpp) ---
     void setup_work_data(size_t work_size);
     void setup_threadpool();
     void reset_threadpool();
@@ -248,5 +252,6 @@ private:
     std::unique_ptr<ThreadPool> m_thread_pool;
     std::atomic<int> m_current_chunk = 0;
 };
+
 
 } // namespace powerserve::ggml

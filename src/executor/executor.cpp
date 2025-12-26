@@ -18,34 +18,47 @@
 
 #include <cstdint>
 
+
 namespace powerserve {
 
 void Executor::allocate_buffers() {
-    for (auto tensor : m_graph.tensors) {
-        if (tensor->m_data) {
-            continue;
-        }
+    
+    // ziqian：增加通过后端决定分配buffer类型
+    const bool use_opencl = m_platform.using_opencl(m_graph.m_model_id);
+    
+    for (auto &node : m_graph.tensors) {
+        auto tensor = node->tensor();
+        if (!tensor) continue;
+
+        if (tensor->m_data) continue;
 
         switch (tensor->m_dtype) {
-        case DataType::FP32: {
-            create_cpu_buffer<float>(tensor);
-        } break;
-
-        case DataType::INT32: {
-            create_cpu_buffer<int32_t>(tensor);
-        } break;
-        case DataType::INT64: {
-            create_cpu_buffer<int64_t>(tensor);
-        } break;
-
+        case DataType::FP32:
+            if (use_opencl) create_opencl_buffer<float>(node);
+            else            create_cpu_buffer<float>(node);
+            break;
+        case DataType::FP16:
+            if (use_opencl) create_opencl_buffer<uint16_t>(node);
+            else            create_cpu_buffer<uint16_t>(node);
+            break;
+        case DataType::INT32:
+            if (use_opencl) create_opencl_buffer<int32_t>(node);
+            else            create_cpu_buffer<int32_t>(node);
+            break;
         default:
-            POWERSERVE_ABORT("could not allocate buffer for data type: {}", static_cast<int>(tensor->m_dtype));
+            POWERSERVE_ABORT("allocate_buffers: unsupported dtype");
         }
     }
+    // ziqian：end
 }
 
+
 void Executor::plan() {
-    m_platform.ggml_backends[m_graph.m_model_id]->plan(m_graph.ops);
+    // ziqian：增加通过后端决定使用什么plan方法
+    auto *backend = m_platform.get_backend(m_graph.m_model_id);
+    POWERSERVE_ASSERT(backend != nullptr);
+    backend->plan(m_graph.ops);
+    // ziqian：end
 }
 
 #ifdef POWERSERVE_DUMP_TENSORS
@@ -75,7 +88,11 @@ void tensor_dump(Tensor* x, std::vector<size_t> max_show_elems, std::string name
 #endif //POWERSERVE_DUMP_TENSORS
 
 void Executor::run() {
+    // ziqian：增加通过后端决定执行哪个算子
     auto &model_id = m_graph.m_model_id;
+    auto *backend = m_platform.get_backend(model_id);
+    POWERSERVE_ASSERT(backend != nullptr);
+    const bool use_opencl = m_platform.using_opencl(model_id);
     plan();
 
     for (auto op : m_graph.ops) {
@@ -84,7 +101,7 @@ void Executor::run() {
             auto weight   = op->prev[0]->tensor();
             auto out      = op->output();
             auto [tokens] = op->get_params<GetEmbeddingParams>();
-            m_platform.ggml_backends[model_id]->get_embedding(out, weight, tokens);
+            backend->get_embedding(out, weight, tokens);
 #ifdef POWERSERVE_DUMP_TENSORS
             std::vector<size_t> dump_embedding_dims={8, 6, 1, 1};
             tensor_dump(out, dump_embedding_dims, "Embedding");
@@ -95,14 +112,14 @@ void Executor::run() {
             auto a   = op->prev[0]->tensor();
             auto b   = op->prev[1]->tensor();
             auto out = op->output();
-            m_platform.ggml_backends[model_id]->add(out, a, b);
+            backend->add(out, a, b);
         } break;
 
         case OpType::MAT_MUL: {
             auto a   = op->prev[0]->tensor();
             auto b   = op->prev[1]->tensor();
             auto out = op->output();
-            m_platform.ggml_backends[model_id]->matmul(out, a, b);
+            backend->matmul(out, a, b);
         } break;
 
         case OpType::RMS_NORM: {
@@ -110,33 +127,33 @@ void Executor::run() {
             auto weight = op->prev[1]->tensor();
             auto out    = op->output();
             auto [eps]  = op->get_params<RMSNormParams>();
-            m_platform.ggml_backends[model_id]->rmsnorm(out, x, weight, eps);
+            backend->rmsnorm(out, x, weight, eps);
         } break;
 
         case OpType::SILU_HADAMARD: {
             auto gate = op->prev[0]->tensor();
             auto up   = op->prev[1]->tensor();
             auto out  = op->output();
-            m_platform.ggml_backends[model_id]->silu_hadamard(out, gate, up);
+            backend->silu_hadamard(out, gate, up);
         } break;
 
         case OpType::ROPE: {
             auto src             = op->prev[0]->tensor();
             auto out             = op->next[0]->tensor();
             auto [pos, rope_cfg] = op->get_params<RopeParams>();
-            m_platform.ggml_backends[model_id]->rope(out, src, pos, rope_cfg);
+            backend->rope(out, src, pos, rope_cfg);
         } break;
 
         case OpType::SOFTMAX: {
             auto x   = op->prev[0]->tensor();
             auto out = op->output();
-            m_platform.ggml_backends[model_id]->softmax(out, x);
+            backend->softmax(out, x);
         } break;
 
         case OpType::COPY: {
             auto dst = op->prev[0]->tensor();
             auto src = op->prev[1]->tensor();
-            m_platform.ggml_backends[model_id]->copy(dst, src);
+            backend->copy(dst, src);
         } break;
 
 #if defined(POWERSERVE_WITH_QNN)
@@ -167,7 +184,7 @@ void Executor::run() {
         case OpType::PRINT: {
             auto x    = op->prev[0]->tensor();
             auto size = op->get_params<PrintParams>().size;
-            m_platform.ggml_backends[model_id]->print(x, size);
+            backend->print(x, size);
 
         } break;
 
@@ -175,23 +192,28 @@ void Executor::run() {
             auto k                 = op->prev[0]->tensor();
             auto v                 = op->prev[1]->tensor();
             auto [L, pos, head_id] = op->get_params<AddCacheParams>();
-            m_platform.ggml_backends[model_id]->add_cache(k, v, L, pos, head_id);
+            backend->add_cache(k, v, L, pos, head_id);
         } break;
-
         case OpType::PERMUTE: {
             auto x      = op->prev[0]->tensor();
             auto out    = op->output();
             auto [axes] = op->get_params<PermuteParams>();
-            m_platform.ggml_backends[model_id]->permute(out, x, axes);
+            backend->permute(out, x, axes);
         } break;
 
         case OpType::CONT: {
             auto x   = op->prev[0]->tensor();
             auto out = op->output();
-            m_platform.ggml_backends[model_id]->cont(out, x);
+            backend->cont(out, x);
         } break;
 
         case OpType::VIEW: {
+            if (use_opencl) {
+                // NOTE: OpenCL view semantics should be handled during allocate_buffers()
+                // via OpenCLBuffer::create_buffer_view (sub-buffer). CPU path mutates pointer/stride directly.
+                POWERSERVE_ABORT("VIEW op on OpenCL backend is not supported in executor run(); "
+                                 "handle views in allocate_buffers() via OpenCLBuffer sub-buffers");
+            }
             auto out                       = op->output();
             auto [stride, offset]          = op->get_params<ViewParams>();
             out->get<CPUBuffer>().m_stride = stride;
@@ -204,10 +226,13 @@ void Executor::run() {
             auto mask              = op->prev[1]->tensor();
             auto [scale, max_bias] = op->get_params<SoftmaxExtParams>();
 
-            m_platform.ggml_backends[model_id]->softmax_ext(out, x, mask, scale, max_bias);
+            backend->softmax_ext(out, x, mask, scale, max_bias);
         } break;
 
         case OpType::GET_MASK: {
+            if (use_opencl) {
+                POWERSERVE_ABORT("GET_MASK currently only supported on CPU backend");
+            }
             auto out         = op->output();
             auto [mask, pos] = op->get_params<GetMaskParams>();
             auto n_kv        = out->m_shape[0];
@@ -226,11 +251,12 @@ void Executor::run() {
         case OpType::TRANSPOSE: {
             auto x   = op->prev[0]->tensor();
             auto out = op->output();
-            m_platform.ggml_backends[model_id]->transpose(out, x);
+            backend->transpose(out, x);
         } break;
         default:
             POWERSERVE_ABORT("Unknown OpType: {}", static_cast<int>(op->op));
         }
     }
-}
-} // namespace powerserve
+    // ziqian：end
+} 
+}// namespace powerserve

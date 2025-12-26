@@ -17,6 +17,29 @@ option(POWERSERVE_ENABLE_HMXPWRCFG "Enable HTP power config performance mode, no
 option(POWERSERVE_ENABLE_HTPRPCPOLL "Enable HTP RPC polling config, not supported on Hexagon version V68" OFF)
 option(POWERSERVE_DUMP_SPEEDINFO "Dump the speed info to file, requires to set environment variable " OFF)
 
+option(POWERSERVE_WITH_OPENCL "Enable OpenCL backend" OFF)
+option(POWERSERVE_OPENCL_DEBUG "Enable OpenCL debug mode" OFF)
+option(POWERSERVE_OPENCL_PROFILING "Enable OpenCL profiling" OFF)
+option(POWERSERVE_OPENCL_EMBED_KERNELS "Embed OpenCL kernels into binary" OFF)
+
+if(POWERSERVE_OPENCL_EMBED_KERNELS)
+    # 启用主开关
+    add_definitions(-DPOWERSERVE_OPENCL_EMBED_KERNELS)
+    
+    # 默认启用所有常用内核
+    add_definitions(-DOPENCL_CPY_CL_AVAILABLE)
+    add_definitions(-DOPENCL_ADD_CL_AVAILABLE)
+    add_definitions(-DOPENCL_MUL_CL_AVAILABLE)
+    add_definitions(-DOPENCL_RMS_NORM_CL_AVAILABLE)
+    add_definitions(-DOPENCL_SILU_CL_AVAILABLE)
+    add_definitions(-DOPENCL_MATMUL_CL_AVAILABLE)
+    add_definitions(-DOPENCL_GELU_CL_AVAILABLE)
+    add_definitions(-DOPENCL_SOFTMAX_CL_AVAILABLE)
+    add_definitions(-DOPENCL_ROPE_CL_AVAILABLE)
+    add_definitions(-DOPENCL_DIAG_MASK_INF_CL_AVAILABLE)
+    # 添加你需要的其他内核
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -82,6 +105,18 @@ if (POWERSERVE_ENABLE_LTO)
     endif()
 endif()
 
+if (POWERSERVE_WITH_OPENCL)
+    add_compile_definitions(POWERSERVE_WITH_OPENCL)
+endif()
+
+if (POWERSERVE_OPENCL_DEBUG)
+    add_compile_definitions(POWERSERVE_OPENCL_DEBUG)
+endif()
+
+if (POWERSERVE_OPENCL_PROFILING)
+    add_compile_definitions(POWERSERVE_OPENCL_PROFILING)
+endif()
+
 if (OHOS)
     add_compile_options(-Wno-unused-command-line-argument)
 endif()
@@ -104,3 +139,4 @@ add_subdirectory(libs)
 add_subdirectory(src)
 add_subdirectory(app)
 add_subdirectory(tools)
+add_subdirectory(tests)

@@ -23,6 +23,26 @@ void Platform::init_ggml_backend(const std::shared_ptr<ModelConfig> &config, con
 void Platform::destroy_ggml_backend(const std::shared_ptr<ModelConfig> &config) {
     ggml_backends.erase(config->model_id);
 }
+#if defined(POWERSERVE_WITH_OPENCL)
+void Platform::init_opencl_backend(const std::shared_ptr<ModelConfig> &config, const HyperParams &hparams) {
+
+    try {
+        auto backend = std::make_unique<opencl::OpenCLBackend>(config->llm, hparams);
+        if (backend->initialize()) {
+            opencl_backends.insert({config->model_id, std::move(backend)});
+            POWERSERVE_LOG_INFO("OpenCL backend initialized for model: {}", config->model_id);
+        } else {
+            POWERSERVE_LOG_ERROR("Failed to initialize OpenCL backend for model: {}", config->model_id);
+        }
+    } catch (const std::exception& e) {
+        POWERSERVE_LOG_ERROR("Exception initializing OpenCL backend: {}", e.what());
+    }
+}
+
+void Platform::destroy_opencl_backend(const std::shared_ptr<ModelConfig> &config) {
+    opencl_backends.erase(config->model_id);
+}
+#endif
 
 #if defined(POWERSERVE_WITH_QNN)
 void Platform::init_qnn_backend(const Path &qnn_path) {
@@ -47,6 +67,30 @@ void Platform::reset_kv_position(std::string &model_id) {
         qnn_backend->m_models[model_id]->reset_kv_cache();
     }
 #endif
+}
+
+bool Platform::using_opencl(const std::string& model_id) const {
+    return opencl_backends.find(model_id) != opencl_backends.end();
+}
+
+Backend* Platform::get_backend(const std::string& model_id) {
+    auto it_cl = opencl_backends.find(model_id);
+    if (it_cl != opencl_backends.end()) {
+        return it_cl->second.get();
+    }
+    auto it_gg = ggml_backends.find(model_id);
+    POWERSERVE_ASSERT(it_gg != ggml_backends.end());
+    return it_gg->second.get();
+}
+
+const Backend* Platform::get_backend(const std::string& model_id) const {
+    auto it_cl = opencl_backends.find(model_id);
+    if (it_cl != opencl_backends.end()) {
+        return it_cl->second.get();
+    }
+    auto it_gg = ggml_backends.find(model_id);
+    POWERSERVE_ASSERT(it_gg != ggml_backends.end());
+    return it_gg->second.get();
 }
 
 } // namespace powerserve

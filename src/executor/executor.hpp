@@ -16,6 +16,10 @@
 
 #include "backend/platform.hpp"
 #include "graph/graph.hpp"
+#include "backend/opencl/opencl_buffer.hpp"  
+#include "backend/opencl/opencl_backend.hpp"
+
+
 
 namespace powerserve {
 
@@ -42,6 +46,27 @@ private:
             tensor->m_data = CPUBuffer::create_buffer<T>(tensor->m_shape);
         }
     }
+
+    // ziqian：增加OpenCL buffer创建
+    template <typename T>
+    void create_opencl_buffer(std::shared_ptr<TensorNode> tensor) {
+        if (tensor->type == NodeType::TENSOR_VIEW) {
+            tensor->m_data =
+                opencl::OpenCLBuffer::create_buffer_view<T>(tensor->tensor_view()->parent->get<opencl::OpenCLBuffer>(), tensor->m_shape);
+        } else {
+             // 关键：base buffer 由 OpenCLBackend 创建（它持有 memory_pool）
+            auto* backend = m_platform.get_backend(m_graph.m_model_id);
+            auto* ocl = dynamic_cast<opencl::OpenCLBackend*>(backend);
+            if (!ocl) {
+                POWERSERVE_ABORT("create_opencl_buffer: backend is not OpenCLBackend");
+            }
+
+            auto ocl_buf = ocl->create_buffer(tensor->m_shape, tensor->m_dtype);
+
+            tensor->m_data = std::static_pointer_cast<BaseBuffer>(ocl_buf);
+        }
+    }
+    // ziqian：end
 };
 
 } // namespace powerserve

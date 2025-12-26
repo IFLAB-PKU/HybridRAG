@@ -1,49 +1,45 @@
-// Copyright 2024-2025 PowerServe Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// 1 platform contains N backends (CPU, NPU, GPU...)
 #pragma once
 
+#include "backend/backend.hpp"
 #include "backend/ggml/ggml.hpp"
-
-#include <map>
+#include "backend/opencl/opencl_backend.hpp"
 
 #if defined(POWERSERVE_WITH_QNN)
 #include "backend/qnn/qnn_backend.hpp"
 #endif
 
+#include "core/config.hpp"
+
+#include <map>
+#include <memory>
+#include <string>
+
 namespace powerserve {
 
 struct Platform {
+public:
+    // key must be std::string (model_id)
     std::map<std::string, std::unique_ptr<ggml::GGMLBackend>> ggml_backends;
+    std::map<std::string, std::unique_ptr<opencl::OpenCLBackend>> opencl_backends;
 
 #if defined(POWERSERVE_WITH_QNN)
-    std::unique_ptr<qnn::QNNBackend> qnn_backend = nullptr;
+    std::unique_ptr<qnn::QNNBackend> qnn_backend;
 #endif
 
 public:
-    Platform() = default;
-
-    ~Platform() = default;
-
-public:
-    // TODO: No need trans config
     void init_ggml_backend(const std::shared_ptr<ModelConfig> &config, const HyperParams &hparams);
     void destroy_ggml_backend(const std::shared_ptr<ModelConfig> &config);
 
+    void init_opencl_backend(const std::shared_ptr<ModelConfig> &config, const HyperParams &hparams);
+    void destroy_opencl_backend(const std::shared_ptr<ModelConfig> &config);
+
+    Backend* get_backend(const std::string& model_id);
+    const Backend* get_backend(const std::string& model_id) const;
+    bool using_opencl(const std::string& model_id) const;
+
 #if defined(POWERSERVE_WITH_QNN)
-    void init_qnn_backend(const Path &qnn_path);
+    void init_qnn_backend(const std::shared_ptr<ModelConfig> &config, const HyperParams &hparams);
+    void destroy_qnn_backend(const std::shared_ptr<ModelConfig> &config);
 #endif
 
     size_t get_kv_position(std::string &model_id) const;
