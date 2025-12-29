@@ -17,21 +17,153 @@
 #include "core/logger.hpp"
 
 #include <cstdint>
+#include <unordered_set>
 
 
 namespace powerserve {
 
+// ziqian：增加通过后端决定分配buffer类型
 void Executor::allocate_buffers() {
-    
-    // ziqian：增加通过后端决定分配buffer类型
     const bool use_opencl = m_platform.using_opencl(m_graph.m_model_id);
-    
+
+    powerserve::opencl::OpenCLBackend* cl_backend = nullptr;
+    if (use_opencl) {
+        cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend*>(
+            m_platform.get_backend(m_graph.m_model_id));
+        POWERSERVE_ASSERT(cl_backend && "OpenCL backend is null or not OpenCLBackend");
+    }
+
+    // ------------------------------------------------------------
+    // 0) Build a set of tensors that must stay on CPU (weights/params)
+    // ------------------------------------------------------------
+    std::unordered_set<Tensor*> skip_migrate;
+    if (use_opencl) {
+        for (auto &op : m_graph.ops) {
+            switch (op->op) {
+            case OpType::GET_EMBEDDING: {
+                // embedding Phase1 expects weight on CPU
+                Tensor* w = op->prev[0]->tensor();   // weight
+                if (w) skip_migrate.insert(w);
+            } break;
+            case OpType::RMS_NORM: {
+                // rmsnorm Phase1 expects weight on CPU (your backend does D2H -> CPU -> H2D)
+                Tensor* w = op->prev[1]->tensor();   // weight
+                if (w) skip_migrate.insert(w);
+            } break;
+            default:
+                break;
+            }
+        }
+    }
+
     for (auto &node : m_graph.tensors) {
         auto tensor = node->tensor();
         if (!tensor) continue;
 
-        if (tensor->m_data) continue;
+        // ------------------------------------------------------------
+        // Special handling for views: OpenCL must allocate sub-buffers
+        // ------------------------------------------------------------
+        if (use_opencl && node->type == NodeType::TENSOR_VIEW) {
+            // If already OpenCLBuffer-backed, nothing to do.
+            if (tensor->m_data) {
+                auto &base = tensor->get<BaseBuffer>();
+                if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&base)) {
+                    continue;
+                }
+            }
 
+            // Views should always be allocated as OpenCL sub-buffers from parent OpenCLBuffer.
+            // If parent hasn't been migrated yet, it will be migrated in its own iteration.
+            // After parent becomes OpenCLBuffer, this allocation will succeed.
+            switch (tensor->m_dtype) {
+            case DataType::FP32:
+                create_opencl_buffer<float>(node);
+                break;
+            case DataType::FP16:
+                create_opencl_buffer<uint16_t>(node);
+                break;
+            case DataType::INT32:
+                create_opencl_buffer<int32_t>(node);
+                break;
+            default:
+                POWERSERVE_ABORT("allocate_buffers(view): unsupported dtype");
+            }
+            continue;
+        }
+
+        // ----------------------------
+        // Case 1: tensor already has buffer
+        // ----------------------------
+        if (tensor->m_data) {
+            if (!use_opencl) {
+                continue; // CPU backend no-op
+            }
+
+            // Do NOT migrate weights/params
+            if (skip_migrate.count(tensor) > 0) {
+                continue;
+            }
+
+            // already OpenCLBuffer -> skip
+            {
+                auto &base = tensor->get<BaseBuffer>();
+                if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&base)) {
+                    continue;
+                }
+            }
+
+            // must be CPUBuffer if we reach here
+            {
+                auto &base = tensor->get<BaseBuffer>();
+                auto *cpu_buf = dynamic_cast<powerserve::CPUBuffer*>(&base);
+                if (!cpu_buf) {
+                    POWERSERVE_ABORT("allocate_buffers: tensor has non-CPU, non-OpenCL buffer type");
+                }
+
+                // dtype whitelist for migration
+                if (tensor->m_dtype != DataType::FP32 &&
+                    tensor->m_dtype != DataType::FP16 &&
+                    tensor->m_dtype != DataType::INT32) {
+                    POWERSERVE_LOG_DEBUG("skip migrate CPU->OpenCL for dtype={} shape=[{}, {}, {}, {}]",
+                                         (int)tensor->m_dtype,
+                                         tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3]);
+                    continue;
+                }
+
+                // 1) clone metadata into tmp tensor (non-view only)
+                Tensor tmp = *tensor;
+                tmp.m_data.reset();
+
+                // 2) allocate OpenCL buffer for tmp
+                switch (tensor->m_dtype) {
+                case DataType::FP32:
+                    create_opencl_buffer_for_tensor<float>(&tmp);
+                    break;
+                case DataType::FP16:
+                    create_opencl_buffer_for_tensor<uint16_t>(&tmp);
+                    break;
+                case DataType::INT32:
+                    create_opencl_buffer_for_tensor<int32_t>(&tmp);
+                    break;
+                default:
+                    POWERSERVE_ABORT("allocate_buffers migrate: unsupported dtype={} shape=[{}, {}, {}, {}]",
+                                     (int)tensor->m_dtype,
+                                     tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3]);
+                }
+
+                // 3) H2D copy
+                cl_backend->copy(&tmp, tensor);
+
+                // 4) replace original CPU buffer
+                tensor->m_data = std::move(tmp.m_data);
+
+                continue;
+            }
+        }
+
+        // ----------------------------
+        // Case 2: tensor has no buffer (original logic)
+        // ----------------------------
         switch (tensor->m_dtype) {
         case DataType::FP32:
             if (use_opencl) create_opencl_buffer<float>(node);
@@ -49,9 +181,9 @@ void Executor::allocate_buffers() {
             POWERSERVE_ABORT("allocate_buffers: unsupported dtype");
         }
     }
-    // ziqian：end
 }
 
+// ziqian：end
 
 void Executor::plan() {
     // ziqian：增加通过后端决定使用什么plan方法
@@ -208,14 +340,44 @@ void Executor::run() {
         } break;
 
         case OpType::VIEW: {
+            auto out = op->output();
+            auto *out_view_node = op->next[0]->tensor_view();
+            POWERSERVE_ASSERT(out_view_node && "VIEW op output is not a TensorViewNode");
+            Tensor *src = out_view_node->parent;
+            POWERSERVE_ASSERT(src && "TensorViewNode parent is null");
+            auto [stride, offset] = op->get_params<ViewParams>();
+
             if (use_opencl) {
-                // NOTE: OpenCL view semantics should be handled during allocate_buffers()
-                // via OpenCLBuffer::create_buffer_view (sub-buffer). CPU path mutates pointer/stride directly.
-                POWERSERVE_ABORT("VIEW op on OpenCL backend is not supported in executor run(); "
-                                 "handle views in allocate_buffers() via OpenCLBuffer sub-buffers");
+                // OpenCL: materialize view as sub-buffer
+                auto &parent = src->get<powerserve::opencl::OpenCLBuffer>();
+
+                std::shared_ptr<powerserve::opencl::OpenCLBuffer> view_buf;
+                switch (out->m_dtype) {
+                    case DataType::FP32:
+                        view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(
+                            parent, out->m_shape, offset);
+                        break;
+                    case DataType::FP16:
+                        view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<uint16_t>(
+                            parent, out->m_shape, offset);
+                        break;
+                    case DataType::INT32:
+                        view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<int32_t>(
+                            parent, out->m_shape, offset);
+                        break;
+                    default:
+                        POWERSERVE_ABORT("VIEW OpenCL unsupported dtype");
+                }
+
+                POWERSERVE_ASSERT(view_buf && "Failed to create OpenCL view buffer");
+                out->m_data = std::static_pointer_cast<BaseBuffer>(view_buf);
+
+                // Important: VIEW carries stride metadata from graph
+                out->get<powerserve::opencl::OpenCLBuffer>().m_stride = stride;
+                break;
             }
-            auto out                       = op->output();
-            auto [stride, offset]          = op->get_params<ViewParams>();
+
+            // CPU behavior unchanged
             out->get<CPUBuffer>().m_stride = stride;
             out->get<CPUBuffer>().m_data   = (char *)out->get<CPUBuffer>().m_data + offset;
         } break;
@@ -230,23 +392,47 @@ void Executor::run() {
         } break;
 
         case OpType::GET_MASK: {
-            if (use_opencl) {
-                POWERSERVE_ABORT("GET_MASK currently only supported on CPU backend");
-            }
             auto out         = op->output();
             auto [mask, pos] = op->get_params<GetMaskParams>();
             auto n_kv        = out->m_shape[0];
             auto batch_size  = out->m_shape[1];
 
             POWERSERVE_ASSERT(out->m_dtype == DataType::FP32);
-            auto mask_buf = (float *)out->get<CPUBuffer>().m_data;
+
+            if (!use_opencl) {
+                // ===== CPU original path =====
+                auto mask_buf = (float *)out->get<CPUBuffer>().m_data;
+                for (size_t i = 0; i < batch_size; i++) {
+                    size_t cur_pos = pos[i];
+                    for (size_t j = 0; j < n_kv; j++) {
+                        mask_buf[j + i * n_kv] = (j <= cur_pos) ? 0.f : -INFINITY;
+                    }
+                }
+                break;
+            }
+
+            // ===== OpenCL bring-up fallback path =====
+            // 1) create a temporary CPU tensor
+            Tensor tmp_cpu(DataType::FP32, out->m_shape);
+            tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+            // 2) fill mask on CPU (same logic)
+            auto mask_buf = (float *)tmp_cpu.get<CPUBuffer>().m_data;
             for (size_t i = 0; i < batch_size; i++) {
                 size_t cur_pos = pos[i];
                 for (size_t j = 0; j < n_kv; j++) {
                     mask_buf[j + i * n_kv] = (j <= cur_pos) ? 0.f : -INFINITY;
                 }
             }
+
+            // 3) copy CPU -> OpenCL output tensor
+            // backend is the current backend (OpenCLBackend when use_opencl)
+            auto *cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend *>(backend);
+            POWERSERVE_ASSERT(cl_backend && "backend is not OpenCLBackend while use_opencl=true");
+            cl_backend->copy(out, &tmp_cpu);
+
         } break;
+
 
         case OpType::TRANSPOSE: {
             auto x   = op->prev[0]->tensor();

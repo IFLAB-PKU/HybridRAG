@@ -52,6 +52,20 @@ int main(int argc, char *argv[]) {
         draft_model->m_platform = platform;
         platform->init_ggml_backend(draft_model->m_config, config.hyper_params);
     }
+    
+    // ziqian: add opencl backend
+#if defined(POWERSERVE_WITH_OPENCL)
+    if (std::getenv("POWERSERVE_USE_OPENCL")) {
+        auto init_one = [&](const std::shared_ptr<powerserve::Model> &m, const char *name) {
+            POWERSERVE_LOG_INFO("POWERSERVE_USE_OPENCL=1 -> init OpenCL backend for {}", name);
+            platform->init_opencl_backend(m->m_config, config.hyper_params);
+        };
+
+        init_one(main_model, "main model");
+        if (args.use_spec) init_one(draft_model, "draft model");
+    }
+#endif
+    // ziqian: end
 
 #if defined(POWERSERVE_WITH_QNN)
     if (!args.no_qnn) {
