@@ -11,6 +11,9 @@
 #include "backend/opencl/opencl_kernel_manager.hpp"
 #include "backend/opencl/opencl_buffer.hpp"
 
+#include "backend/ggml/ggml.hpp"     
+#include "ggml.h"    
+
 #include "core/config.hpp"
 #include "core/tensor.hpp"
 #include "core/thread_pool.hpp"
@@ -84,6 +87,7 @@ public:
     // ========= Backend interface (MUST match base) =========
     void plan(std::vector<std::shared_ptr<OpNode>> &ops) override;
 
+    void add_broadcast(Tensor *dst, const Tensor *src0, const Tensor *src1) const;
     void add_minimal(Tensor * dst, const Tensor * src0, const Tensor * src1) const;
     void add(const Tensor *dst, const Tensor *src0, const Tensor *src1) const override;
     void get_embedding(const Tensor *dst, const Tensor *weight, const std::vector<int> &tokens) const override;
@@ -208,10 +212,20 @@ private:
         const Tensor *src0,
         const Tensor *src1
     ) const;
+    void matmul_cpu_ggml_fallback(
+        const Tensor *dst,
+        const Tensor *src0,
+        const Tensor *src1
+    ) const;
+
 private:
     // Tensor -> OpenCL buffer mapping (legacy path; if you已经把 buffer 放在 Tensor 内部，可逐步淘汰)
     mutable std::unordered_map<const Tensor *, cl_mem> tensor_buffers_;
     mutable std::mutex buffer_mutex_;
+
+    // ---- GGML reusable fallback executor for CPU ops (matmul etc.) ----
+    mutable std::unique_ptr<powerserve::ggml::GGMLBackend> m_ggml_fallback;
+    mutable size_t m_ggml_fallback_wsize = 0;
 
     void ensure_kv_cache_allocated_v0();
     mutable ModelConfig::LLMConfig m_llm;   // 保存模型参数来源
