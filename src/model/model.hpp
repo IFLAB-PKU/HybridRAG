@@ -131,6 +131,15 @@ public:
         return {};
     };
 
+    virtual auto compute_rerank_score(const std::vector<Token> &tokens, size_t batch_size) 
+    -> float {
+        (void)tokens; // unused
+        (void)batch_size; // unused
+        POWERSERVE_LOG_ERROR("compute_rerank_score is not implemented for this model.");
+        throw std::runtime_error("Rerank not supported");
+        return 0.0f;
+    };
+
 public:
     virtual auto decode(Sampler &sampler, const std::vector<Token> tokens, const std::vector<int> pos, bool lm_head)
         -> std::vector<Token> = 0;
