@@ -106,6 +106,14 @@ void collect_config(gguf_context *ctx, nlohmann::json &config) {
     config["model_arch"]   = model_arch;
     auto get_arch_config([&model_arch](const std::string &c) { return fmt::format(fmt::runtime(c), model_arch); });
 
+    // [NEW] Check for reranker flag
+    std::string model_name = get_str(ctx, "general.name", false, "");
+    if (model_name.find("Rerank") != std::string::npos) {
+        config["is_reranker"] = true;
+    } else {
+        config["is_reranker"] = false;
+    }
+
     { // embed_dim, ffn_dim, n_heads, n_kv_heads, n_layers, n_ctx
         config["embed_dim"]       = get_u32(ctx, get_arch_config("{}.embedding_length"));
         config["ffn_dim"]         = get_u32(ctx, get_arch_config("{}.feed_forward_length"));
