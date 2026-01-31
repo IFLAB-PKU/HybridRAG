@@ -3,6 +3,8 @@
 
 #include "backend/opencl/opencl_context.hpp"
 #include "core/logger.hpp"
+#include "core/data_type.hpp"
+
 #include <CL/cl.h>
 #include <string>
 #include <unordered_map>
@@ -15,10 +17,10 @@ namespace powerserve::opencl {
 // 编译选项结构体
 struct OpenCLCompileOptions {
     std::string opencl_c_std = "CL3.0";  // OpenCL C版本
-    bool enable_mad = true;              // -cl-mad-enable
-    bool unsafe_math = true;             // -cl-unsafe-math-optimizations
-    bool finite_math = true;             // -cl-finite-math-only
-    bool fast_relaxed_math = true;       // -cl-fast-relaxed-math
+    bool enable_mad = false;              // -cl-mad-enable
+    bool unsafe_math = false;             // -cl-unsafe-math-optimizations
+    bool finite_math = false;             // -cl-finite-math-only
+    bool fast_relaxed_math = false;       // -cl-fast-relaxed-math
     std::string extra_options = "";      // 额外选项
     
     std::string to_string() const {
@@ -36,7 +38,7 @@ struct OpenCLCompileOptions {
 struct KernelCacheItem {
     cl_kernel kernel = nullptr;
     std::string name;
-    size_t last_used = 0;  // 用于LRU缓存
+    mutable size_t last_used = 0;  // 用于LRU缓存
 };
 
 // 程序缓存项
@@ -79,7 +81,8 @@ public:
     // === 内核获取接口 ===
     
     // 获取已编译的内核
-    cl_kernel get_kernel(const std::string& kernel_name);
+    cl_kernel get_kernel(const std::string& kernel_name) const;
+    cl_kernel get_cpy_kernel(powerserve::DataType src_t, powerserve::DataType dst_t) const;
     
     // 检查内核是否存在
     bool has_kernel(const std::string& kernel_name) const;

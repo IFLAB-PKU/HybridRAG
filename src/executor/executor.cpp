@@ -18,11 +18,15 @@
 
 #include <cstdint>
 #include <unordered_set>
+#include <cstdint>
+#include <array>
+#include <string>
+#include <fmt/core.h>
 
 
 namespace powerserve {
 
-// ziqian add: debug hook impl
+// ziqian add: debug hook impl and other debug tools
 // ===== Debug hook impl =====
 static OpAfterExecHook g_after_exec_hook = nullptr;
 
@@ -32,6 +36,70 @@ void set_op_after_exec_hook(OpAfterExecHook hook) {
 
 OpAfterExecHook & get_op_after_exec_hook() {
     return g_after_exec_hook;
+}
+
+// 简单稳定 hash：FNV-1a 64-bit
+static inline uint64_t fnv1a_u64(uint64_t h, uint64_t x) {
+    constexpr uint64_t FNV_PRIME = 1099511628211ull;
+    h ^= x;
+    h *= FNV_PRIME;
+    return h;
+}
+
+static inline uint64_t hash_u64(uint64_t h, uint64_t x) {
+    return fnv1a_u64(h, x);
+}
+
+// 把 dtype/shape 编码进 hash
+static inline uint64_t hash_tensor_meta(uint64_t h, const powerserve::Tensor *t) {
+    if (!t) {
+        return hash_u64(h, 0xdeadbeefull);
+    }
+    h = hash_u64(h, (uint64_t)t->m_dtype);
+
+    // 形状固定 4 维
+    auto sh = t->m_shape;
+    h = hash_u64(h, (uint64_t)sh[0]);
+    h = hash_u64(h, (uint64_t)sh[1]);
+    h = hash_u64(h, (uint64_t)sh[2]);
+    h = hash_u64(h, (uint64_t)sh[3]);
+
+    // view / buffer-kind 也可以编码（可选）
+    h = hash_u64(h, (uint64_t)(t->m_data ? 1 : 0));
+
+    return h;
+}
+
+// 对整个 ops 列表做 signature hash
+static uint64_t hash_ops_signature(const std::vector<std::shared_ptr<powerserve::OpNode>> &ops) {
+    uint64_t h = 1469598103934665603ull; // FNV offset basis
+    h = hash_u64(h, (uint64_t)ops.size());
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto &op = ops[i];
+        if (!op) {
+            h = hash_u64(h, 0xabad1deau);
+            continue;
+        }
+
+        h = hash_u64(h, (uint64_t)op->op);        // op type
+        h = hash_u64(h, (uint64_t)op->prev.size());
+        h = hash_u64(h, (uint64_t)op->next.size());
+
+        // prev tensors meta
+        for (auto &p : op->prev) {
+            const powerserve::Tensor *t = p ? p->tensor() : nullptr;
+            h = hash_tensor_meta(h, t);
+        }
+
+        // next tensors meta
+        for (auto &n : op->next) {
+            const powerserve::Tensor *t = n ? n->tensor() : nullptr;
+            h = hash_tensor_meta(h, t);
+        }
+    }
+
+    return h;
 }
 // ziqian: end
 
@@ -69,38 +137,60 @@ void Executor::allocate_buffers() {
         }
     }
 
+    std::unordered_set<Tensor*> view_op_outputs;
+    if (use_opencl) {
+        for (auto &op : m_graph.ops) {
+            if (op && op->op == OpType::VIEW) {
+                Tensor* out = op->output();
+                if (out) view_op_outputs.insert(out);
+            }
+        }
+    }
+
     for (auto &node : m_graph.tensors) {
         auto tensor = node->tensor();
         if (!tensor) continue;
 
-        // ------------------------------------------------------------
-        // Special handling for views: OpenCL must allocate sub-buffers
-        // ------------------------------------------------------------
         if (use_opencl && node->type == NodeType::TENSOR_VIEW) {
-            // If already OpenCLBuffer-backed, nothing to do.
+            // 1) VIEW op 的输出：run() 里会按 (stride, offset) 物化 OpenCL view（避免重复）
+            if (view_op_outputs.count(tensor) > 0) {
+                continue;
+            }
+
+            // 2) 其他 view（比如 transpose/permute 产生的 TensorViewNode）：
             if (tensor->m_data) {
                 auto &base = tensor->get<BaseBuffer>();
                 if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&base)) {
                     continue;
                 }
+                // 如果这里不是 OpenCLBuffer，说明 view 在 OpenCL 模式下混入了 CPUBuffer（通常是你还没处理的迁移路径）
+                POWERSERVE_ABORT("allocate_buffers(view): view tensor has non-OpenCL buffer under use_opencl");
             }
 
-            // Views should always be allocated as OpenCL sub-buffers from parent OpenCLBuffer.
-            // If parent hasn't been migrated yet, it will be migrated in its own iteration.
-            // After parent becomes OpenCLBuffer, this allocation will succeed.
+            auto *view_node = node->tensor_view();
+            POWERSERVE_ASSERT(view_node && "allocate_buffers(view): tensor_view() is null");
+            POWERSERVE_ASSERT(view_node->parent && "allocate_buffers(view): parent is null");
+            POWERSERVE_ASSERT(view_node->parent->m_data && "allocate_buffers(view): parent has no buffer");
+
+            auto &parent_cl = view_node->parent->get<powerserve::opencl::OpenCLBuffer>();
+
+            std::shared_ptr<powerserve::opencl::OpenCLBuffer> view_buf;
             switch (tensor->m_dtype) {
             case DataType::FP32:
-                create_opencl_buffer<float>(node);
+                view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(parent_cl, tensor->m_shape, /*offset=*/0);
                 break;
             case DataType::FP16:
-                create_opencl_buffer<uint16_t>(node);
+                view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<uint16_t>(parent_cl, tensor->m_shape, /*offset=*/0);
                 break;
             case DataType::INT32:
-                create_opencl_buffer<int32_t>(node);
+                view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<int32_t>(parent_cl, tensor->m_shape, /*offset=*/0);
                 break;
             default:
                 POWERSERVE_ABORT("allocate_buffers(view): unsupported dtype");
             }
+
+            POWERSERVE_ASSERT(view_buf && "allocate_buffers(view): failed to create OpenCL view buffer");
+            tensor->m_data = std::static_pointer_cast<BaseBuffer>(view_buf);
             continue;
         }
 
@@ -236,6 +326,22 @@ void Executor::run() {
     POWERSERVE_ASSERT(backend != nullptr);
     const bool use_opencl = m_platform.using_opencl(model_id);
     plan();
+
+    // ziqian: compare whether two backends have same op order
+    // uint64_t h = hash_ops_signature(m_graph.ops);
+    // fmt::print("[OPSEQ HASH] model_id={} ops={} hash=0x{:016x}\n",
+    //            m_graph.m_model_id,
+    //            m_graph.ops.size(),
+    //            h);
+
+    // // 可选：打印前 20 个 op 概览，便于肉眼核对
+    // int limit = std::min<int>(20, (int)m_graph.ops.size());
+    // for (int i = 0; i < limit; ++i) {
+    //     auto &op = m_graph.ops[i];
+    //     fmt::print("  [op#{:03d}] type={} prev={} next={}\n",
+    //                i, (int)op->op, op->prev.size(), op->next.size());
+    // }
+    
 
     int op_idx = 0;
 

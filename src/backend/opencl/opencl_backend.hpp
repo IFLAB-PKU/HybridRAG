@@ -138,6 +138,9 @@ public:
     std::shared_ptr<OpenCLBuffer> debug_get_k_cache(size_t L) const;
     std::shared_ptr<OpenCLBuffer> debug_get_v_cache(size_t L) const;
     
+    // Lightweight cache tensor wrappers for graph construction.
+    std::pair<Tensor, Tensor> get_cache_tensors(size_t L) const;
+
     // 张量属性检查 / 并行任务估算（如果还需要）
     bool is_contiguous(const Tensor *tensor, int n) const;
     int  get_n_tasks(std::shared_ptr<OpNode> op);
@@ -227,7 +230,7 @@ private:
     mutable std::unique_ptr<powerserve::ggml::GGMLBackend> m_ggml_fallback;
     mutable size_t m_ggml_fallback_wsize = 0;
 
-    void ensure_kv_cache_allocated_v0();
+    void ensure_kv_cache_allocated_v0(size_t batch_size);
     mutable ModelConfig::LLMConfig m_llm;   // 保存模型参数来源
     mutable HyperParams m_hparams;          // 如果未来要用也方便
     mutable std::unique_ptr<powerserve::opencl::OpenCLKV> m_kv;

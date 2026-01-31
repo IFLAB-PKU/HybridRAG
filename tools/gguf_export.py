@@ -88,6 +88,7 @@ def export_executable(out_path: Path, plats: Set[support_plat_l]) -> Path:
                 "cmake",
                 "-DCMAKE_BUILD_TYPE=Release",
                 "-DPOWERSERVE_WITH_QNN=OFF",
+                "-DPOWERSERVE_WITH_OPENCL=ON",
                 "-S",
                 root_folder,
                 "-B",

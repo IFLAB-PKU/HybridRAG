@@ -3,6 +3,8 @@
 
 
 #include "core/logger.hpp"
+#include "ggml-quants.h"
+#include "ggml.h"
 
 #include <iostream>
 #include <CL/cl.h>
@@ -12,6 +14,10 @@
 #include <cmath>
 #include <algorithm>
 #include <execinfo.h>
+#include <fmt/core.h>
+#include <mutex>
+#include <cstdlib>   // getenv, atoi
+
 
 #define CL_CHECK(call) \
     do { \
@@ -37,6 +43,19 @@ std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_v_cache(size_t L) const {
     return m_kv->value[L];
 }
 
+std::pair<Tensor, Tensor> OpenCLBackend::get_cache_tensors(size_t L) const {
+    POWERSERVE_ASSERT(m_kv && m_kv->allocated());
+    POWERSERVE_ASSERT(L < m_kv->key.size());
+
+    Shape shape{m_kv->kv_dim, m_kv->max_seq_len, 1, 1};
+    Tensor k_cache(DataType::FP32, shape);
+    Tensor v_cache(DataType::FP32, shape);
+    k_cache.m_data = m_kv->key[L];
+    v_cache.m_data = m_kv->value[L];
+
+    return {k_cache, v_cache};
+}
+
 static inline const char* dtype_name(DataType t) {
     switch (t) {
         case DataType::FP32: return "FP32";
@@ -44,6 +63,14 @@ static inline const char* dtype_name(DataType t) {
         case DataType::INT32: return "INT32";
         default: return "OTHER";
     }
+}
+
+static inline bool kv_dbg_enabled() {
+    static int on = []() -> int {
+        const char* e = std::getenv("POWERSERVE_KV_DBG");
+        return e ? std::atoi(e) : 0;
+    }();
+    return on != 0;
 }
 
 static inline void log_tensor_meta(OpenCLBackend *self, const char *tag, const Tensor *t, int n = 4) {
@@ -55,18 +82,15 @@ static inline void log_tensor_meta(OpenCLBackend *self, const char *tag, const T
 
     powerserve::Stride st{};
     bool has_stride = false;
-    try {
-        const auto &buf = const_cast<Tensor*>(t)->get<OpenCLBuffer>();
-        st = buf.m_stride;
+    BaseBuffer& base = const_cast<Tensor*>(t)->get<BaseBuffer>();
+    if (auto *buf = dynamic_cast<OpenCLBuffer*>(&base)) {
+        st = buf->m_stride;
         has_stride = true;
-    } catch (...) {
-        try {
-            const auto &buf = const_cast<Tensor*>(t)->get<powerserve::CPUBuffer>();
-            st = buf.m_stride;
-            has_stride = true;
-        } catch (...) {
-            has_stride = false;
-        }
+    } else if (auto *buf = dynamic_cast<powerserve::CPUBuffer*>(&base)) {
+        st = buf->m_stride;
+        has_stride = true;
+    } else {
+        has_stride = false;
     }
 
     if (has_stride) {
@@ -95,6 +119,59 @@ static inline void dump_backtrace() {
     free(syms);
 }
 // for debug end
+
+// ---- ggml-compat helpers for quant nbytes/stride ----
+static inline bool is_ggml_quant_dtype(powerserve::DataType dt) {
+    using powerserve::DataType;
+    return dt == DataType::GGML_Q4_0 || dt == DataType::GGML_Q8_0;
+}
+
+// contiguous logical tensor bytes in ggml layout
+static inline size_t ggml_compat_nbytes(powerserve::DataType dt, const powerserve::Shape &s) {
+    const size_t ne0 = (size_t)s[0];
+    const size_t ne1 = (size_t)s[1];
+    const size_t ne2 = (size_t)s[2];
+    const size_t ne3 = (size_t)s[3];
+
+    if (is_ggml_quant_dtype(dt)) {
+        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
+        // ggml_nbytes for quant types is row_size(ne0) * ne1 * ne2 * ne3
+        return (size_t)ggml_row_size(gt, (int64_t)ne0) * ne1 * ne2 * ne3;
+    }
+
+    const size_t elem = powerserve::get_type_size(dt); // fp32=4, fp16=2...
+    POWERSERVE_ASSERT(elem > 0);
+    return elem * ne0 * ne1 * ne2 * ne3;
+}
+
+static inline powerserve::Stride ggml_compat_contig_stride_bytes(powerserve::DataType dt, const powerserve::Shape &s) {
+    powerserve::Stride st{};
+    if (is_ggml_quant_dtype(dt)) {
+        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
+        st[0] = (size_t)ggml_type_size(gt);                 // Q8_0 => 34
+        st[1] = (size_t)ggml_row_size(gt, (int64_t)s[0]);   // Q8_0 row bytes
+    } else {
+        const size_t elem = powerserve::get_type_size(dt);
+        POWERSERVE_ASSERT(elem > 0);
+        st[0] = elem;
+        st[1] = st[0] * (size_t)s[0];
+    }
+    st[2] = st[1] * (size_t)s[1];
+    st[3] = st[2] * (size_t)s[2];
+    return st;
+}
+
+static void ensure_ggml_global_init_once() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        ggml_init_params p{};
+        p.mem_size   = 1024 * 1024; 
+        p.mem_buffer = NULL;
+        ggml_context* ctx = ggml_init(p);
+        ggml_free(ctx);
+    });
+}
+
 
 OpenCLBackend::OpenCLBackend(const ModelConfig::LLMConfig &llm,
                              const HyperParams &hparams)
@@ -144,6 +221,8 @@ bool OpenCLBackend::initialize() {
         return true;
     }
     
+    ensure_ggml_global_init_once(); 
+
     // 1. 创建OpenCL上下文
     context = std::make_shared<OpenCLContext>();
     if (!context->initialize(device_preference)) {
@@ -160,18 +239,20 @@ bool OpenCLBackend::initialize() {
     // 4. 初始化内核管理器
     OpenCLCompileOptions options;
     options.opencl_c_std = "CL3.0";
-    options.enable_mad = true;
-    options.unsafe_math = true;
-    options.finite_math = true;
-    options.fast_relaxed_math = true;
+    options.enable_mad = false;
+    options.unsafe_math = false;
+    options.finite_math = false;
+    options.fast_relaxed_math = false;
     
+    POWERSERVE_LOG_INFO("[OpenCL] global compile_options: {}", options.to_string());
+
     if (!kernel_manager->initialize(options)) {
         POWERSERVE_LOG_ERROR("Failed to initialize OpenCL kernel manager");
         return false;
     }
 
     // 5. 初始化kv cache
-    ensure_kv_cache_allocated_v0();
+    ensure_kv_cache_allocated_v0(1);
 
     // ---- setup reusable GGML fallback backend ----
     if (!m_ggml_fallback) {
@@ -180,6 +261,12 @@ bool OpenCLBackend::initialize() {
         m_ggml_fallback->setup_threadpool();  // GGMLBackend::setup_threadpool() creates ThreadPool :contentReference[oaicite:4]{index=4}
     }
     
+    constexpr size_t kMinFallbackWSize = 256ULL * 1024 * 1024;
+    if (m_ggml_fallback_wsize < kMinFallbackWSize) {
+        m_ggml_fallback->setup_work_data(kMinFallbackWSize);
+        m_ggml_fallback_wsize = kMinFallbackWSize;
+    }
+
     initialized = true;
     
     return true;
@@ -218,151 +305,129 @@ static inline powerserve::Stride make_contig_stride_bytes(const powerserve::Shap
     return s;
 }
 
-bool OpenCLBackend::is_contiguous(const Tensor *tensor, int n) const {
-    if (!tensor) return false;
-    const size_t elem = powerserve::get_type_size(tensor->m_dtype);
+bool OpenCLBackend::is_contiguous(const Tensor *t, int n) const {
+    if (!t) return false;
+    if (n <= 0) return true;
 
-    // Only care first n dims (caller decides), but we store strides for full rank=4
-    const auto expected = make_contig_stride_bytes(tensor->m_shape, elem);
+    // 1) 计算 expected stride（单位：bytes）
+    size_t expected[GGML_MAX_DIMS] = {0};
 
-    try {
-        const auto &buf = const_cast<Tensor*>(tensor)->get<OpenCLBuffer>();
-        for (int i = 0; i < n; ++i) {
-            if (buf.m_stride[i] != expected[i]) return false;
+    // nb0：第 0 维的“步长”= 一个元素/一个block的字节数
+    size_t nb0 = 0;
+    bool is_quant = (t->m_dtype == DataType::GGML_Q4_0 || t->m_dtype == DataType::GGML_Q8_0);
+
+    if (is_quant) {
+        const enum ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(t->m_dtype);
+        nb0 = (size_t)ggml_type_size(gt);               // e.g. Q8_0: 34
+        expected[0] = nb0;
+        if (n > 1) {
+            expected[1] = (size_t)ggml_row_size(gt, (int64_t)t->m_shape[0]); // nb1（关键）
         }
-        return true;
-    } catch (...) {
-        // CPU path (optional, keeps function generic)
-        try {
-            const auto &buf = const_cast<Tensor*>(tensor)->get<powerserve::CPUBuffer>();
-            for (int i = 0; i < n; ++i) {
-                if (buf.m_stride[i] != expected[i]) return false;
-            }
-            return true;
-        } catch (...) {
-            return false;
+    } else {
+        nb0 = powerserve::get_type_size(t->m_dtype);    // fp32=4, fp16=2...
+        expected[0] = nb0;
+        if (n > 1) {
+            expected[1] = expected[0] * (size_t)t->m_shape[0];
         }
     }
+
+    // 2) 维度 >=2 的 stride 都是前一维 stride * 前一维长度（循环形式）
+    for (int i = 2; i < n; ++i) {
+        expected[i] = expected[i - 1] * (size_t)t->m_shape[i - 1];
+    }
+
+    // 3) 取出实际 stride 并比较
+    const size_t *actual = nullptr;
+    BaseBuffer& base = const_cast<Tensor*>(t)->get<BaseBuffer>();
+    if (auto *buf = dynamic_cast<OpenCLBuffer*>(&base)) {
+        actual = buf->m_stride.data();
+    } else if (auto *buf = dynamic_cast<powerserve::CPUBuffer*>(&base)) {
+        actual = buf->m_stride.data();
+    } else {
+        return false;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        if ((size_t)actual[i] != expected[i]) return false;
+    }
+    return true;
 }
 
-static inline void pack_contiguous_cpu_f32(
-    powerserve::opencl::OpenCLBackend *self,
-    const Tensor *src,
-    Tensor *dst_contig_dev
-) {
-    POWERSERVE_ASSERT(self && src && dst_contig_dev);
+static inline void cpy_tensor_cl(const OpenCLBackend* self,
+                                 const Tensor* src,
+                                 const Tensor* dst) {
+    POWERSERVE_ASSERT(self && src && dst);
 
-    if (src->m_dtype != DataType::FP32 || dst_contig_dev->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 only supports FP32 (got src={}, dst={})",
-                             (int)src->m_dtype, (int)dst_contig_dev->m_dtype);
-        return;
-    }
-    if (dst_contig_dev->m_shape != src->m_shape) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 shape mismatch");
-        return;
-    }
+    // CL_CHECK requires a variable named `context` in scope
+    auto* context = self->context.get();
+    POWERSERVE_ASSERT(context != nullptr);
 
-    // ----------------------------
-    // D2H: src -> host_src
-    // ----------------------------
-    Tensor host_src(DataType::FP32, src->m_shape);
-    host_src.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
+    // Must be OpenCL tensors
+    // NOTE: Tensor::get<BaseBuffer>() is non-const in this repo, so we const_cast locally.
+    auto* src_cl = dynamic_cast<OpenCLBuffer*>(
+        &const_cast<Tensor*>(src)->get<BaseBuffer>());
 
-    self->copy(&host_src, src);
+    auto* dst_cl = dynamic_cast<OpenCLBuffer*>(
+        &const_cast<Tensor*>(dst)->get<BaseBuffer>());
 
-    // Get src strides in bytes (from CPUBuffer after D2H copy)
-    powerserve::CPUBuffer *src_cpu = nullptr;
-    try {
-        src_cpu = &host_src.get<powerserve::CPUBuffer>();
-    } catch (const std::bad_cast &e) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32: host_src is not CPUBuffer? {}", e.what());
+    if (!src_cl || !dst_cl) {
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: src/dst not OpenCLBuffer");
         return;
     }
 
-    const auto s = src->m_shape;         // {ne0,ne1,ne2,ne3}
-    const auto nb = src_cpu->m_stride;   // bytes stride for host_src
-
-    const size_t ne0 = s[0], ne1 = s[1], ne2 = s[2], ne3 = s[3];
-    const size_t elem = sizeof(float);
-
-    // ----------------------------
-    // CPU pack -> host_contig
-    // ----------------------------
-    Tensor host_contig(DataType::FP32, src->m_shape);
-    host_contig.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
-
-    float *dst_ptr = static_cast<float *>(host_contig.get<powerserve::CPUBuffer>().m_data);
-    const char *src_base = static_cast<const char *>(src_cpu->m_data);
-
-    // destination is standard contiguous row-major in your stride convention:
-    // linear index = (((i3*ne2 + i2)*ne1 + i1)*ne0 + i0)
-    size_t out_idx = 0;
-    for (size_t i3 = 0; i3 < ne3; ++i3) {
-        for (size_t i2 = 0; i2 < ne2; ++i2) {
-            for (size_t i1 = 0; i1 < ne1; ++i1) {
-                // Pointer to the start of this (i1,i2,i3) slice in src
-                const char *src_row = src_base
-                    + (size_t)i3 * (size_t)nb[3]
-                    + (size_t)i2 * (size_t)nb[2]
-                    + (size_t)i1 * (size_t)nb[1];
-
-                for (size_t i0 = 0; i0 < ne0; ++i0) {
-                    const char *p = src_row + (size_t)i0 * (size_t)nb[0];
-                    float v;
-                    std::memcpy(&v, p, elem);
-                    dst_ptr[out_idx++] = v;
-                }
-            }
-        }
+    // Same logical shape required
+    if (src->m_shape != dst->m_shape) {
+        POWERSERVE_ABORT(
+            "cpy_tensor_cl: shape mismatch src=[{},{},{},{}] dst=[{},{},{},{}]",
+            src->m_shape[0], src->m_shape[1], src->m_shape[2], src->m_shape[3],
+            dst->m_shape[0], dst->m_shape[1], dst->m_shape[2], dst->m_shape[3]
+        );
     }
 
-    // ----------------------------
-    // H2D: host_contig -> dst_contig_dev
-    // ----------------------------
-    self->copy(dst_contig_dev, &host_contig);
-}
 
-static inline void pack_contiguous_cl_f32(const OpenCLBackend* self,
-                                   const Tensor* src,
-                                   Tensor* dst_contig) {
-    auto context = self->context;
-    POWERSERVE_ASSERT(src && dst_contig);
-    auto& src_buf = src->get<OpenCLBuffer>();
-    auto& dst_buf = dst_contig->get<OpenCLBuffer>();
+    // Kernel dispatch by dtype pair
+    cl_kernel k = self->kernel_manager->get_cpy_kernel(src->m_dtype, dst->m_dtype);
+    if (!k) {
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: unsupported dtype pair src={} dst={}",
+                             (int)src->m_dtype, (int)dst->m_dtype);
+        return;
+    }
 
-    cl_mem src_mem = src_buf.get_device_buffer();
-    cl_mem dst_mem = dst_buf.get_device_buffer();
-    POWERSERVE_ASSERT(src_mem && dst_mem);
+    cl_mem src_mem = src_cl->get_device_buffer();
+    cl_mem dst_mem = dst_cl->get_device_buffer();
+    if (!src_mem || !dst_mem) {
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: invalid cl_mem");
+        return;
+    }
 
-    cl_kernel k = self->kernel_manager->get_kernel("kernel_cpy_f32_f32");
-    POWERSERVE_ASSERT(k);
-
-    // shape (assume 4D padded)
+    // shape (4D)
     const int ne00 = (int)src->m_shape[0];
     const int ne01 = (int)src->m_shape[1];
     const int ne02 = (int)src->m_shape[2];
     const int ne03 = (int)src->m_shape[3];
 
-    const int ne0  = (int)dst_contig->m_shape[0];
-    const int ne1  = (int)dst_contig->m_shape[1];
-    const int ne2  = (int)dst_contig->m_shape[2];
-    const int ne3  = (int)dst_contig->m_shape[3];
+    const int ne0  = (int)dst->m_shape[0];
+    const int ne1  = (int)dst->m_shape[1];
+    const int ne2  = (int)dst->m_shape[2];
+    const int ne3  = (int)dst->m_shape[3];
 
-    // strides in bytes
-    const auto sst = src_buf.get_stride();
+    // strides in bytes (from OpenCLBuffer stride metadata)
+    const auto sst = src_cl->get_stride();
     const cl_ulong nb00 = (cl_ulong)sst[0];
     const cl_ulong nb01 = (cl_ulong)sst[1];
     const cl_ulong nb02 = (cl_ulong)sst[2];
     const cl_ulong nb03 = (cl_ulong)sst[3];
 
-    const auto dstst = dst_buf.get_stride(); // dst 是 create_buffer 创建的，天然 contiguous
+    const auto dstst = dst_cl->get_stride();
     const cl_ulong nb0 = (cl_ulong)dstst[0];
     const cl_ulong nb1 = (cl_ulong)dstst[1];
     const cl_ulong nb2 = (cl_ulong)dstst[2];
     const cl_ulong nb3 = (cl_ulong)dstst[3];
 
-    const cl_ulong off0 = 0;
-    const cl_ulong offd = 0;
+    // Offsets:
+    // Scheme-B: views are NOT sub-buffers, so we must pass base offsets explicitly.
+    const cl_ulong off0 = (cl_ulong)src_cl->get_base_offset();
+    const cl_ulong offd = (cl_ulong)dst_cl->get_base_offset();
 
     cl_uint arg = 0;
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &src_mem));
@@ -370,30 +435,29 @@ static inline void pack_contiguous_cl_f32(const OpenCLBackend* self,
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &dst_mem));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &offd));
 
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne00));
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne01));
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne02));
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne03));
-
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne03));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb00));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb01));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb02));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb03));
 
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne0));
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne1));
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne2));
-    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne3));
-
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne1));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne2));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int),      &ne3));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb0));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb1));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb2));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb3));
 
-    // 先用最稳妥配置避免 CL_INVALID_WORK_GROUP_SIZE（bring-up）
-    const size_t nth = 1;
-    const size_t local[3]  = { nth, 1, 1 };
-    const size_t global[3] = { (size_t)ne01 * nth, (size_t)ne02, (size_t)ne03 };
+    // Work sizes:
+    // This matches llama.cpp's cpy.cl style where each work-item handles (i1,i2,i3)
+    // and the kernel loops over i0 internally.
+    const size_t local[3]  = { 1, 1, 1 };
+    const size_t global[3] = { (size_t)ne01, (size_t)ne02, (size_t)ne03 };
 
     CL_CHECK(clEnqueueNDRangeKernel(self->context->get_queue(),
                                     k, 3, nullptr, global, local,
@@ -420,7 +484,7 @@ static inline const Tensor * ensure_contiguous_or_pack_f32(
         return src; // fallback: return src, but caller should be aware this may break
     }
 
-    pack_contiguous_cpu_f32(self, src, &tmp_dev);
+    cpy_tensor_cl(self, src, &tmp_dev);
 
     // Safety: packed result must be contiguous
     if (!self->is_contiguous(&tmp_dev, n_dims_check)) {
@@ -428,6 +492,37 @@ static inline const Tensor * ensure_contiguous_or_pack_f32(
     }
     return &tmp_dev;
 }
+
+static inline void pack_contiguous_cpu_f32(
+    powerserve::opencl::OpenCLBackend *self,
+    const Tensor *src,
+    Tensor *dst_contig_dev
+) {
+    POWERSERVE_ASSERT(self && src && dst_contig_dev);
+
+    if (src->m_dtype != DataType::FP32 || dst_contig_dev->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 only supports FP32 (got src={}, dst={})",
+                             (int)src->m_dtype, (int)dst_contig_dev->m_dtype);
+        return;
+    }
+    if (dst_contig_dev->m_shape != src->m_shape) {
+        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 shape mismatch");
+        return;
+    }
+
+    // 1) 先在 device 上把 non-contig view pack 成 contig（stride-aware）
+    Tensor tmp_dev;
+    const Tensor *src_packed = ensure_contiguous_or_pack_f32(self, src, /*n_dims_check=*/4, tmp_dev);
+
+    // 2) D2H：读回已经连续的 src_packed
+    Tensor host_contig(DataType::FP32, src->m_shape);
+    host_contig.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
+    self->copy(&host_contig, src_packed);
+
+    // 3) H2D：写入 dst_contig_dev（连续）
+    self->copy(dst_contig_dev, &host_contig);
+}
+
 
 // ==================== 算子实现 ====================
 
@@ -492,14 +587,28 @@ void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor 
     cl_uint idx = 0;
     const int n_i = static_cast<int>(n);
 
+    // Scheme-B: pass base offsets explicitly (bytes)
+    const cl_ulong off0 = (cl_ulong)src0->get<OpenCLBuffer>().get_base_offset();
+    const cl_ulong off1 = (cl_ulong)src1->get<OpenCLBuffer>().get_base_offset();
+    const cl_ulong offd = (cl_ulong)dst ->get<OpenCLBuffer>().get_base_offset();
+
     err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &a);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg a failed"); return; }
+
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off0);
+    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg off0 failed"); return; }
 
     err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &b);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg b failed"); return; }
 
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off1);
+    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg off1 failed"); return; }
+
     err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &o);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg out failed"); return; }
+
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offd);
+    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg offd failed"); return; }
 
     err = clSetKernelArg(kernel, idx++, sizeof(int), &n_i);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg n failed"); return; }
@@ -626,10 +735,10 @@ void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor 
         cl_int err;
         cl_uint arg_index = 0;
         
-        // 所有版本的通用偏移（目前都设为0）
-        cl_ulong offset0 = 0;
-        cl_ulong offset1 = 0;
-        cl_ulong offsetd = 0;
+        cl_ulong offset0 = (cl_ulong)src0_buffer.get_base_offset();
+        cl_ulong offset1 = (cl_ulong)src1_buffer.get_base_offset();
+        cl_ulong offsetd = (cl_ulong)dst_buffer.get_base_offset();
+
         
         if (bcast_row) {
             // 行广播版本（7个参数）
@@ -971,28 +1080,61 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     // ---- 3) ggml mul_mat (reusable GGMLBackend, correct params/workspace/threadpool) ----
     POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
 
-    // workspace sizing (copy from GGMLBackend::plan() logic for MAT_MUL) :contentReference[oaicite:6]{index=6}
-    const enum ggml_type vec_dot_type = m_ggml_fallback->get_vec_dot_type(b_host);
-    const enum ggml_type w_type = powerserve::ggml::convert_datatype_to_ggml(a_host->m_dtype);
+    // IMPORTANT:
+    // In this repo, matmul fallback must keep operand order as (A=weight, B=activation).
+    // Swapping them triggers ggml.c assertion (GGML_ASSERT(ne0 == ne01)).
+    const Tensor *w_host = a_host; // weight (often quant)
+    const Tensor *x_host = b_host; // activation (usually FP32)
 
-    size_t required_wsize = 0;
-    if (w_type != vec_dot_type) {
-        required_wsize = ggml_row_size(vec_dot_type, a_host->n_elements());
+    // ---- shape sanity check (fail fast with readable logs instead of ggml assert) ----
+    // Expected (ggml-style) here: w:[K,N], x:[K,M]  => dst:[N,M]
+    const int64_t K_w = (int64_t)w_host->m_shape[0];
+    const int64_t N_w = (int64_t)w_host->m_shape[1];
+    const int64_t K_x = (int64_t)x_host->m_shape[0];
+    const int64_t M_x = (int64_t)x_host->m_shape[1];
+
+    const int64_t N_dst = (int64_t)dst->m_shape[0];
+    const int64_t M_dst = (int64_t)dst->m_shape[1];
+
+    if (!(K_w == K_x && N_w == N_dst && M_x == M_dst)) {
+        POWERSERVE_LOG_ERROR(
+            "matmul_cpu_ggml_fallback shape mismatch: "
+            "w=[K={},N={}] x=[K={},M={}] dst=[N={},M={}]",
+            (long long)K_w, (long long)N_w,
+            (long long)K_x, (long long)M_x,
+            (long long)N_dst, (long long)M_dst
+        );
+        POWERSERVE_ABORT("matmul_cpu_ggml_fallback: abort due to incompatible shapes (would trigger ggml assert)");
+    }
+
+    // ---- workspace sizing ----
+    // Your tests allocate at least sizeof(float) * (K + 64) * n_threads for ggml ops
+    // (same idea as ggml's scratch usage). See tests/opencl_test.cpp. :contentReference[oaicite:0]{index=0}
+    const size_t n_threads = (size_t)m_hparams.n_threads;
+    size_t required_wsize = sizeof(float) * (size_t)(K_w + 64) * n_threads;
+
+    // Also keep your original "type conversion" workspace logic (only increases, never hurts)
+    {
+        const enum ggml_type vec_dot_type = m_ggml_fallback->get_vec_dot_type(x_host);
+        const enum ggml_type w_type       = powerserve::ggml::convert_datatype_to_ggml(w_host->m_dtype);
+        if (w_type != vec_dot_type) {
+            const size_t extra = (size_t)ggml_row_size(vec_dot_type, (int64_t)w_host->n_elements());
+            required_wsize = std::max(required_wsize, extra);
+        }
     }
 
     // only grow, never shrink
     if (required_wsize > m_ggml_fallback_wsize) {
-        m_ggml_fallback->setup_work_data(required_wsize); // will add cache line padding internally :contentReference[oaicite:7]{index=7}
+        m_ggml_fallback->setup_work_data(required_wsize);
         m_ggml_fallback_wsize = required_wsize;
     }
 
-    // run ggml matmul
-    m_ggml_fallback->matmul(&host_c, a_host, b_host);
+    // run ggml matmul (KEEP ORDER: weight first, activation second)
+    m_ggml_fallback->matmul(&host_c, w_host, x_host);
 
     // ---- 4) H2D: host_c -> dst ----
     this->copy(dst, &host_c);
 }
-
 
 
 void OpenCLBackend::matmul_batched_cpu_f32_fallback(
@@ -1082,12 +1224,27 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
 
     auto *self = const_cast<OpenCLBackend *>(this);
 
+    // --------------------------------------------
+    // Inline helper: check if tensor holds OpenCLBuffer
+    // --------------------------------------------
+    auto is_opencl = [](const Tensor *t) -> bool {
+#if defined(POWERSERVE_WITH_OPENCL)
+        return t && t->m_data &&
+               dynamic_cast<powerserve::opencl::OpenCLBuffer*>(t->m_data.get()) != nullptr;
+#else
+        (void)t;
+        return false;
+#endif
+    };
+
     // ---- Try OpenCL minimal kernel only when it's safe ----
-    const bool all_f32 = (dst->m_dtype == DataType::FP32 &&
+    const bool all_f32 = (dst->m_dtype  == DataType::FP32 &&
                           src0->m_dtype == DataType::FP32 &&
                           src1->m_dtype == DataType::FP32);
 
-    if (all_f32) {
+    const bool all_opencl = is_opencl(dst) && is_opencl(src0) && is_opencl(src1);
+
+    if (all_f32 && all_opencl) {
         Tensor tmpA_dev, tmpB_dev;
         const int n_dims_check = 4;
 
@@ -1113,8 +1270,25 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     }
 
     // ---- General fallback: ggml mul_mat (supports FP32/FP16/quant + arbitrary layout) ----
-    self->matmul_cpu_ggml_fallback(dst, src0, src1);
+    // Important: ggml fallback requires CPU tensors.
+    // We must materialize OpenCL inputs to CPU, and if dst is OpenCL, copy the result back.
+
+    const Tensor *A_cpu = src0;  // src0 may be CPU quant weight (dtype=6), keep as-is
+    const Tensor *B_cpu = src1;
+
+    Tensor tmpB_cpu;
+    if (is_opencl(src1)) {
+        // D2H src1 into tmpB_cpu (FP32)
+        tmpB_cpu = Tensor(DataType::FP32, src1->m_shape);
+        tmpB_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(src1->m_shape);
+        self->copy(&tmpB_cpu, src1);
+        B_cpu = &tmpB_cpu;
+    }
+
+    // Run ggml fallback matmul on CPU
+    self->matmul_cpu_ggml_fallback(dst, A_cpu, B_cpu);
 }
+
 
 void OpenCLBackend::matmul_minimal(Tensor * dst,
                                   const Tensor * src0,
@@ -1222,27 +1396,22 @@ void OpenCLBackend::matmul_minimal(Tensor * dst,
     }
 }
 
-
 void OpenCLBackend::rmsnorm(
     const Tensor *o,
     const Tensor *x,
     const Tensor *weight,
     float eps
 ) const {
-    if (!initialized) {
-        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+    if (!initialized || !m_ggml_fallback) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm not ready");
         return;
     }
     if (!o || !x || !weight) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm got null tensor");
         return;
     }
-
-    // ----------------------------
-    // Strict contract (Phase2 v0)
-    // ----------------------------
     if (o->m_dtype != DataType::FP32 || x->m_dtype != DataType::FP32 || weight->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm fallback only supports FP32");
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm strict only supports FP32");
         return;
     }
     if (o->m_shape != x->m_shape) {
@@ -1250,88 +1419,32 @@ void OpenCLBackend::rmsnorm(
         return;
     }
 
-    const int hidden = (int)x->m_shape[0];
-    if (hidden <= 0) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm hidden dim invalid: {}", hidden);
-        return;
-    }
-    // weight expected to be 1D-like with hidden in dim0
-    if ((int)weight->m_shape[0] != hidden) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm weight.shape[0] must equal hidden ({}), got {}",
-                             hidden, (int)weight->m_shape[0]);
-        return;
-    }
-
-    // x/o must be OpenCLBuffer-backed
-    OpenCLBuffer *x_cl = nullptr;
-    OpenCLBuffer *o_cl = nullptr;
-    powerserve::CPUBuffer *w_cpu = nullptr;
-
-    try {
-        x_cl = &const_cast<Tensor *>(x)->get<OpenCLBuffer>();
-        o_cl = &const_cast<Tensor *>(o)->get<OpenCLBuffer>();
-    } catch (const std::bad_cast &e) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm expects x/o backed by OpenCLBuffer: {}", e.what());
-        return;
-    }
-
-    try {
-        w_cpu = &const_cast<Tensor *>(weight)->get<powerserve::CPUBuffer>();
-    } catch (const std::bad_cast &e) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm expects weight backed by CPUBuffer: {}", e.what());
-        return;
-    }
-
-    if (!w_cpu->m_data) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm weight CPU data is null");
-        return;
-    }
-
-    // ----------------------------
-    // D2H: x -> host_x
-    // ----------------------------
+    // 1) D2H: x -> host_x
     Tensor host_x(DataType::FP32, x->m_shape);
     host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
+    this->copy(&host_x, x);
 
-    this->copy(&host_x, x);  // D2H path already implemented
-
-    auto *x_host = static_cast<float *>(host_x.get<powerserve::CPUBuffer>().m_data);
-    auto *w_host = static_cast<float *>(w_cpu->m_data);
-
-    // ----------------------------
-    // CPU compute
-    // ----------------------------
-    Tensor host_y(DataType::FP32, o->m_shape);
-    host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(o->m_shape);
-    auto *y_host = static_cast<float *>(host_y.get<powerserve::CPUBuffer>().m_data);
-
-    // treat as [hidden, rows, 1, 1]
-    const int rows = (int)(x->m_shape[1] * x->m_shape[2] * x->m_shape[3]);
-    const float inv_hidden = 1.0f / (float)hidden;
-
-    for (int r = 0; r < rows; ++r) {
-        const float *xr = x_host + (size_t)r * hidden;
-        float *yr = y_host + (size_t)r * hidden;
-
-        // mean square
-        double sumsq = 0.0;
-        for (int i = 0; i < hidden; ++i) {
-            const float v = xr[i];
-            sumsq += (double)v * (double)v;
-        }
-        const float mean = (float)(sumsq * inv_hidden);
-        const float scale = 1.0f / std::sqrt(mean + eps);
-
-        for (int i = 0; i < hidden; ++i) {
-            yr[i] = xr[i] * scale * w_host[i];
-        }
+    // 2) 确保 weight 在 CPU；如果不是，就 D2H 一份
+    const Tensor *host_w_ptr = weight;
+    Tensor host_w;
+    try {
+        (void)const_cast<Tensor*>(weight)->get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &) {
+        host_w = Tensor(DataType::FP32, weight->m_shape);
+        host_w.m_data = powerserve::CPUBuffer::create_buffer<float>(weight->m_shape);
+        this->copy(&host_w, weight);
+        host_w_ptr = &host_w;
     }
 
-    // ----------------------------
-    // H2D: host_y -> o
-    // ----------------------------
+    // 3) GGML 计算
+    Tensor host_y(DataType::FP32, o->m_shape);
+    host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(o->m_shape);
+    m_ggml_fallback->rmsnorm(&host_y, &host_x, host_w_ptr, eps);
+
+    // 4) H2D: host_y -> o
     this->copy(o, &host_y);
 }
+
 
 // for rope
 static inline float rope_yarn_ramp(const float low, const float high, const int i0) {
@@ -1404,14 +1517,18 @@ void OpenCLBackend::rope(
         POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
         return;
     }
+    if (!m_ggml_fallback) {
+        POWERSERVE_LOG_ERROR("m_ggml_fallback is null (initialize() not called?)");
+        return;
+    }
     if (!out || !src) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rope got null tensor");
         return;
     }
 
-    // ---- strict dtype/shape ----
+    // strict：先只支持 FP32 + same shape（和你原来一致）
     if (out->m_dtype != DataType::FP32 || src->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope CPU fallback only supports FP32");
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports FP32");
         return;
     }
     if (out->m_shape != src->m_shape) {
@@ -1419,106 +1536,21 @@ void OpenCLBackend::rope(
         return;
     }
 
-    // minimal shape contract: {dim, batch, 1, 1}
-    const int dim   = (int)src->m_shape[0];
-    const int ne1   = (int)src->m_shape[1]; // heads
-    const int ne2   = (int)src->m_shape[2]; // tokens/time
-    const int ne3   = (int)src->m_shape[3]; // batch (bring-up：先限制 1)
-
-    if (ne3 != 1) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports shape[3]==1 for now, got {}", ne3);
-        return;
-    }
-
-    // 兼容旧测试：如果 shape[2]==1 且 pos.size()==shape[1]，就把 shape[1] 当 token 数
-    const bool legacy_axis1 = (ne2 == 1 && (int)pos.size() == ne1);
-
-    // H = head 数，T = token 数
-    const int H = legacy_axis1 ? 1   : ne1;
-    const int T = legacy_axis1 ? ne1 : ne2;
-
-    if (!legacy_axis1 && (int)pos.size() != T) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope pos.size() must equal n_tokens (shape[2]) = {}, got {}",
-                            T, (int)pos.size());
-        return;
-    }
-
-    const int n_dims = rope_cfg.n_dims;
-    if (n_dims <= 0 || (n_dims % 2) != 0 || n_dims > dim) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope invalid rope_cfg.n_dims");
-        return;
-    }
-
-    // rope_type: treat -1 as 0
-    const int rope_type = (rope_cfg.rope_type < 0) ? 0 : rope_cfg.rope_type;
-
-    // GGML_ROPE_TYPE_NEOX is commonly 2
-    const bool is_neox = (rope_type & GGML_ROPE_TYPE_NEOX) != 0;
-
-    // ---- D2H src -> host_x ----
+    // 1) D2H: src -> host_x (CPUBuffer)
     Tensor host_x(DataType::FP32, src->m_shape);
     host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
     this->copy(&host_x, src);
-    float *x_host = static_cast<float *>(host_x.get<powerserve::CPUBuffer>().m_data);
 
-    // ---- CPU compute -> host_y ----
+    // 2) CPU: 用 GGML 同源实现算 rope
     Tensor host_y(DataType::FP32, out->m_shape);
     host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
-    float *y_host = static_cast<float *>(host_y.get<powerserve::CPUBuffer>().m_data);
 
-    // prepare cache for cos/sin (size dim, interleaved cos/sin)
-    std::vector<float> cache((size_t)dim);
-    float corr_dims[2];
-    rope_yarn_corr_dims(n_dims, rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.beta_fast, rope_cfg.beta_slow, corr_dims);
+    m_ggml_fallback->rope(&host_y, &host_x, pos, rope_cfg);
 
-    const float theta_scale = std::pow(rope_cfg.freq_base, -2.0f / (float)n_dims);
-    const float sin_sign = 1.0f; // forward only
-
-    for (int t = 0; t < T; ++t) {
-        const float theta_base = (float)pos[t];
-
-        // 每个 token 初始化一次 cache
-        rope_cache_init(theta_base, rope_cfg.freq_scale, /*freq_factors*/nullptr,
-                        corr_dims, (int64_t)dim, rope_cfg.ext_factor, rope_cfg.attn_factor,
-                        cache.data(), sin_sign, theta_scale);
-
-        for (int h = 0; h < H; ++h) {
-            // contiguous layout: ((t * H + h) * dim)
-            const size_t row = ((size_t)t * (size_t)H + (size_t)h) * (size_t)dim;
-            float *x = x_host + row;
-            float *y = y_host + row;
-
-            std::memcpy(y, x, sizeof(float) * (size_t)dim);
-
-            if (!is_neox) {
-                // norm: rotate (i0, i0+1)
-                for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                    const float cos_theta = cache[(size_t)i0 + 0];
-                    const float sin_theta = cache[(size_t)i0 + 1];
-                    const float x0 = x[i0 + 0];
-                    const float x1 = x[i0 + 1];
-                    y[i0 + 0] = x0 * cos_theta - x1 * sin_theta;
-                    y[i0 + 1] = x0 * sin_theta + x1 * cos_theta;
-                }
-            } else {
-                // neox: rotate (ic, ic + n_dims/2)
-                const int half = n_dims / 2;
-                for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                    const int ic = i0 / 2;
-                    const float cos_theta = cache[(size_t)i0 + 0];
-                    const float sin_theta = cache[(size_t)i0 + 1];
-                    const float x0 = x[ic];
-                    const float x1 = x[ic + half];
-                    y[ic]        = x0 * cos_theta - x1 * sin_theta;
-                    y[ic + half] = x0 * sin_theta + x1 * cos_theta;
-                }
-            }
-        }
-    }
-
-    // ---- H2D host_y -> out ----
+    // 3) H2D: host_y -> out
     this->copy(out, &host_y);
 }
+
 
 
 void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {
@@ -1530,80 +1562,34 @@ void OpenCLBackend::permute(const Tensor *out, const Tensor *x, Shape axes) cons
     if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
     if (!out || !x)   POWERSERVE_ABORT("permute got null tensor");
 
-    // permute = view: share the same underlying buffer, only rewrite stride
     auto *dst = const_cast<Tensor*>(out);
 
-    // require OpenCL buffers
-    auto &xbuf = const_cast<Tensor*>(x)->get<OpenCLBuffer>();
-    (void)xbuf.get_device_buffer(); // touch to validate
+    OpenCLBuffer *xbuf = nullptr;
+    OpenCLBuffer *obuf = nullptr;
+    try {
+        xbuf = &const_cast<Tensor*>(x)->get<OpenCLBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::permute expects OpenCLBuffer input: {}", e.what());
+        POWERSERVE_ABORT("permute: input not OpenCLBuffer");
+    }
 
-    // share underlying cl_mem (including sub-buffer views)
-    dst->m_data = x->m_data;
+    if (!dst->m_data) {
+        auto view = OpenCLBuffer::create_buffer_view<float>(*xbuf, dst->m_shape, /*offset=*/0);
+        POWERSERVE_ASSERT(view && "permute: failed to create OpenCL view buffer");
+        dst->m_data = std::static_pointer_cast<BaseBuffer>(view);
+    }
 
-    auto &obuf = dst->get<OpenCLBuffer>();
+    try {
+        obuf = &dst->get<OpenCLBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::permute expects OpenCLBuffer output: {}", e.what());
+        POWERSERVE_ABORT("permute: output not OpenCLBuffer");
+    }
+
     // new_stride[i] = old_stride[axes[i]]  (same as ggml: :contentReference[oaicite:6]{index=6})
     Stride new_stride{};
-    for (size_t i = 0; i < axes.size(); ++i) new_stride[i] = xbuf.m_stride[axes[i]];
-    obuf.m_stride = new_stride;
-}
-
-void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
-    if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
-    if (!out || !x)   POWERSERVE_ABORT("cont got null tensor");
-
-    // If already contiguous, a plain copy is fine
-    if (is_contiguous(x, 4)) {
-        this->copy(out, x);
-        return;
-    }
-
-    const size_t elem = powerserve::get_type_size(x->m_dtype);
-
-    // D2H: read raw physical buffer bytes into host_in (contiguous physical)
-    Tensor host_in(x->m_dtype, x->m_shape);
-    Tensor host_out(x->m_dtype, x->m_shape);
-
-    // allocate CPU buffers with correct element type size
-    switch (x->m_dtype) {
-    case DataType::FP32:
-        host_in.m_data  = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
-        break;
-    case DataType::FP16:
-        host_in.m_data  = powerserve::CPUBuffer::create_buffer<uint16_t>(x->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<uint16_t>(x->m_shape);
-        break;
-    case DataType::INT32:
-        host_in.m_data  = powerserve::CPUBuffer::create_buffer<int32_t>(x->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(x->m_shape);
-        break;
-    default:
-        POWERSERVE_ABORT("cont: unsupported dtype={}", (int)x->m_dtype);
-    }
-
-    this->copy(&host_in, x);
-
-    // Reorder: logical -> contiguous
-    const auto &shape  = x->m_shape;
-    const auto &stride = const_cast<Tensor*>(x)->get<OpenCLBuffer>().m_stride; // bytes
-
-    const char *src = reinterpret_cast<const char*>(host_in.get<powerserve::CPUBuffer>().m_data);
-    char *dst       = reinterpret_cast<char*>(host_out.get<powerserve::CPUBuffer>().m_data);
-
-    size_t idx = 0;
-    for (size_t i3 = 0; i3 < shape[3]; ++i3) {
-        for (size_t i2 = 0; i2 < shape[2]; ++i2) {
-            for (size_t i1 = 0; i1 < shape[1]; ++i1) {
-                for (size_t i0 = 0; i0 < shape[0]; ++i0, ++idx) {
-                    const size_t off = i0 * stride[0] + i1 * stride[1] + i2 * stride[2] + i3 * stride[3];
-                    std::memcpy(dst + idx * elem, src + off, elem);
-                }
-            }
-        }
-    }
-
-    // H2D
-    this->copy(out, &host_out);
+    for (size_t i = 0; i < axes.size(); ++i) new_stride[i] = xbuf->m_stride[axes[i]];
+    obuf->m_stride = new_stride;
 }
 
 static inline uint32_t floor_log2_u32(uint32_t x) {
@@ -1758,69 +1744,103 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
                                  const Tensor * hb,
                                  const Tensor * hb2) const {
     if (!initialized) {
-        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
-        return;
+        POWERSERVE_ABORT("OpenCL backend not initialized");
     }
-
     if (!out || !hb || !hb2) {
-        POWERSERVE_LOG_ERROR("silu_hadamard got null tensor");
-        return;
+        POWERSERVE_ABORT("silu_hadamard got null tensor");
     }
 
-    // minimal: FP32 + same-shape + contiguous-only by convention
+    // dtype hard constraint (minimal kernel)
     if (out->m_dtype != DataType::FP32 ||
         hb->m_dtype  != DataType::FP32 ||
         hb2->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("silu_hadamard minimal only supports FP32");
-        return;
+        POWERSERVE_ABORT("silu_hadamard only supports FP32");
     }
 
+    // shape hard constraint
     if (out->m_shape != hb->m_shape || out->m_shape != hb2->m_shape) {
-        POWERSERVE_LOG_ERROR("silu_hadamard requires same shape");
-        return;
+        POWERSERVE_ABORT("silu_hadamard requires same shape");
     }
+
+    // ---- NEW: layout hard constraints (match GGML preconditions) ----
+    // 1) contiguous
+    POWERSERVE_ASSERT(is_contiguous(out, 0));
+    POWERSERVE_ASSERT(is_contiguous(hb, 0));
+    POWERSERVE_ASSERT(is_contiguous(hb2, 0));
 
     const size_t n = out->n_elements();
     if (n == 0) return;
 
-    cl_mem a = nullptr;   // hb
-    cl_mem b = nullptr;   // hb2
-    cl_mem o = nullptr;   // out
+    // DEBUG: force CPU fallback for SILU_HADAMARD
+    // ============================
+    {
+        // 1) Prepare CPU tensors (contiguous FP32)
+        Tensor hb_cpu(DataType::FP32, hb->m_shape);
+        hb_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(hb->m_shape);
+
+        Tensor hb2_cpu(DataType::FP32, hb2->m_shape);
+        hb2_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(hb2->m_shape);
+
+        Tensor out_cpu(DataType::FP32, out->m_shape);
+        out_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+        // 2) D2H: copy OpenCL -> CPU
+        // (OpenCLBackend::copy already supports CPU<->OpenCL in this repo’s flow)
+        this->copy(&hb_cpu, hb);
+        this->copy(&hb2_cpu, hb2);
+
+        // 3) Compute on CPU using GGML ref implementation if available
+        if (m_ggml_fallback) {
+            m_ggml_fallback->silu_hadamard(&out_cpu, &hb_cpu, &hb2_cpu);
+        } else {
+            // Fallback to the same formula as GGMLBackend::silu_hadamard
+            float *out_data = static_cast<float *>(out_cpu.get<CPUBuffer>().m_data);
+            float *hb_data  = static_cast<float *>(hb_cpu.get<CPUBuffer>().m_data);
+            float *hb2_data = static_cast<float *>(hb2_cpu.get<CPUBuffer>().m_data);
+            for (size_t j = 0; j < hb_cpu.n_elements(); ++j) {
+                float val = hb_data[j];
+                val *= (1.0f / (1.0f + expf(-val)));
+                val *= hb2_data[j];
+                out_data[j] = val;
+            }
+        }
+
+        // 4) H2D: copy CPU -> OpenCL output
+        this->copy(out, &out_cpu);
+        return;
+    }
+
+
+    cl_mem a = nullptr;
+    cl_mem b = nullptr;
+    cl_mem o = nullptr;
     try {
         a = hb ->get<OpenCLBuffer>().get_device_buffer();
         b = hb2->get<OpenCLBuffer>().get_device_buffer();
         o = out->get<OpenCLBuffer>().get_device_buffer();
     } catch (const std::bad_cast & e) {
-        POWERSERVE_LOG_ERROR("silu_hadamard expects OpenCLBuffer: {}", e.what());
-        return;
+        POWERSERVE_ABORT("silu_hadamard expects OpenCLBuffer: {}", e.what());
     }
 
     if (!a || !b || !o) {
-        POWERSERVE_LOG_ERROR("silu_hadamard invalid cl_mem");
-        return;
+        POWERSERVE_ABORT("silu_hadamard invalid cl_mem");
     }
 
     cl_kernel kernel = kernel_manager->get_kernel("kernel_silu_hadamard_contig_f32");
     if (!kernel) {
-        POWERSERVE_LOG_ERROR("kernel not found: kernel_silu_hadamard_contig_f32");
-        return;
+        POWERSERVE_ABORT("kernel not found: kernel_silu_hadamard_contig_f32");
     }
 
     cl_int err = CL_SUCCESS;
     cl_uint idx = 0;
-    const int n_i = static_cast<int>(n);
 
-    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &a);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg hb failed"); return; }
+    // also consider uint to avoid int overflow long term
+    const cl_uint n_u = (cl_uint)n;
 
-    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &b);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg hb2 failed"); return; }
-
-    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &o);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg out failed"); return; }
-
-    err = clSetKernelArg(kernel, idx++, sizeof(int), &n_i);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg n failed"); return; }
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &a); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg hb failed");
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &b); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg hb2 failed");
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &o); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg out failed");
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_uint), &n_u); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg n failed");
 
     const size_t local = 256;
     const size_t global = round_up(n, local);
@@ -1828,13 +1848,12 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
     cl_command_queue q = context->get_queue();
     err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_ERROR("clEnqueueNDRangeKernel failed: {}", context->get_error_string(err));
-        return;
+        POWERSERVE_ABORT("clEnqueueNDRangeKernel failed: {}", context->get_error_string(err));
     }
 
     err = clFinish(q);
     if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
+        POWERSERVE_ABORT("clFinish failed: {}", context->get_error_string(err));
     }
 }
 
@@ -1845,6 +1864,7 @@ static inline size_t dtype_size(DataType dt) {
         case DataType::FP32: return 4;
         case DataType::FP16: return 2;
         case DataType::INT32: return 4;
+        case DataType::INT64: return 8;
         default: return 0;
     }
 }
@@ -1855,6 +1875,115 @@ static inline size_t numel_4d(const Tensor* t) {
     for (int i = 0; i < 4; ++i) n *= static_cast<size_t>(t->m_shape[i]);
     return n;
 }
+
+static inline bool is_cpy_kernel_supported(powerserve::DataType t) {
+    return t == DataType::FP16 || t == DataType::FP32;
+}
+
+static inline bool pack_cpu_strided_to_contig(const Tensor* src, void* dst_contig) {
+    POWERSERVE_ASSERT(src != nullptr);
+    POWERSERVE_ASSERT(dst_contig != nullptr);
+
+    const size_t elem = dtype_size(src->m_dtype);
+    if (elem == 0) {
+        POWERSERVE_LOG_ERROR("pack_cpu_strided_to_contig: unsupported dtype {}", (int)src->m_dtype);
+        return false;
+    }
+
+    powerserve::CPUBuffer* src_cpu = nullptr;
+    try {
+        src_cpu = &const_cast<Tensor*>(src)->get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("pack_cpu_strided_to_contig: src is not CPUBuffer? {}", e.what());
+        return false;
+    }
+
+    const auto s = src->m_shape;
+    const auto nb = src_cpu->m_stride;
+    const size_t ne0 = s[0], ne1 = s[1], ne2 = s[2], ne3 = s[3];
+
+    const char* src_base = static_cast<const char*>(src_cpu->m_data);
+    char* dst_ptr = static_cast<char*>(dst_contig);
+
+    size_t out_idx = 0;
+    for (size_t i3 = 0; i3 < ne3; ++i3) {
+        for (size_t i2 = 0; i2 < ne2; ++i2) {
+            for (size_t i1 = 0; i1 < ne1; ++i1) {
+                const char* src_row = src_base
+                    + (size_t)i3 * (size_t)nb[3]
+                    + (size_t)i2 * (size_t)nb[2]
+                    + (size_t)i1 * (size_t)nb[1];
+
+                for (size_t i0 = 0; i0 < ne0; ++i0) {
+                    const char* p = src_row + (size_t)i0 * (size_t)nb[0];
+                    std::memcpy(dst_ptr + out_idx * elem, p, elem);
+                    ++out_idx;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+static inline bool unpack_contig_to_cpu_strided(const void* src_contig, const Tensor* dst) {
+    POWERSERVE_ASSERT(src_contig != nullptr);
+    POWERSERVE_ASSERT(dst != nullptr);
+
+    const size_t elem = dtype_size(dst->m_dtype);
+    if (elem == 0) {
+        POWERSERVE_LOG_ERROR("unpack_contig_to_cpu_strided: unsupported dtype {}", (int)dst->m_dtype);
+        return false;
+    }
+
+    powerserve::CPUBuffer* dst_cpu = nullptr;
+    try {
+        dst_cpu = &const_cast<Tensor*>(dst)->get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("unpack_contig_to_cpu_strided: dst is not CPUBuffer? {}", e.what());
+        return false;
+    }
+
+    const auto s = dst->m_shape;
+    const auto nb = dst_cpu->m_stride;
+    const size_t ne0 = s[0], ne1 = s[1], ne2 = s[2], ne3 = s[3];
+
+    const char* src_ptr = static_cast<const char*>(src_contig);
+    char* dst_base = static_cast<char*>(dst_cpu->m_data);
+
+    size_t in_idx = 0;
+    for (size_t i3 = 0; i3 < ne3; ++i3) {
+        for (size_t i2 = 0; i2 < ne2; ++i2) {
+            for (size_t i1 = 0; i1 < ne1; ++i1) {
+                char* dst_row = dst_base
+                    + (size_t)i3 * (size_t)nb[3]
+                    + (size_t)i2 * (size_t)nb[2]
+                    + (size_t)i1 * (size_t)nb[1];
+
+                for (size_t i0 = 0; i0 < ne0; ++i0) {
+                    char* p = dst_row + (size_t)i0 * (size_t)nb[0];
+                    std::memcpy(p, src_ptr + in_idx * elem, elem);
+                    ++in_idx;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+static inline Tensor make_contig_dev_tensor(
+    OpenCLBackend* self,
+    powerserve::DataType dtype,
+    const powerserve::Shape& shape
+) {
+    Tensor t(dtype, shape);
+    auto buf = self->create_buffer(shape, dtype);
+    t.m_data = std::static_pointer_cast<BaseBuffer>(buf);
+    return t;
+}
+
+
 // for copy end
 
 void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
@@ -1871,10 +2000,95 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         return;
     }
 
-    const size_t src_bytes = numel_4d(src) * dtype_size(src->m_dtype);
-    const size_t dst_bytes = numel_4d(dst) * dtype_size(dst->m_dtype);
+    const size_t src_bytes = ggml_compat_nbytes(src->m_dtype, src->m_shape);
+    const size_t dst_bytes = ggml_compat_nbytes(dst->m_dtype, dst->m_shape);
+
+
     if (src_bytes == 0 || dst_bytes == 0 || src_bytes != dst_bytes) {
         POWERSERVE_LOG_ERROR("copy: size mismatch src_bytes={} dst_bytes={}", src_bytes, dst_bytes);
+        return;
+    }
+
+    const bool shape_match = src->m_shape == dst->m_shape;
+    if (!shape_match) {
+        const bool src_contig = is_contiguous(src, 4);
+        const bool dst_contig = is_contiguous(dst, 4);
+
+        if (!src_contig || !dst_contig) {
+            POWERSERVE_LOG_ERROR("copy: shape mismatch with non-contiguous src/dst is unsupported");
+            return;
+        }
+
+        BaseBuffer& src_base = src->get<BaseBuffer>();
+        BaseBuffer& dst_base = dst->get<BaseBuffer>();
+
+        auto* src_cpu = dynamic_cast<powerserve::CPUBuffer*>(&src_base);
+        auto* dst_cpu = dynamic_cast<powerserve::CPUBuffer*>(&dst_base);
+        auto* src_cl  = dynamic_cast<OpenCLBuffer*>(&src_base);
+        auto* dst_cl  = dynamic_cast<OpenCLBuffer*>(&dst_base);
+
+        if (src_cpu && dst_cpu) {
+            std::memcpy(dst_cpu->m_data, src_cpu->m_data, src_bytes);
+            return;
+        }
+
+        if (src_cpu && dst_cl) {
+            cl_mem dev = dst_cl->get_device_buffer();
+            if (!dev || !src_cpu->m_data) {
+                POWERSERVE_LOG_ERROR("copy: invalid host/dev for shape-mismatch H2D");
+                return;
+            }
+            const size_t dst_off = dst_cl->get_base_offset();
+            if (!memory_pool->copy_host_to_device(dev, src_cpu->m_data, src_bytes, dst_off)) {
+                POWERSERVE_LOG_ERROR("copy: shape-mismatch H2D copy_host_to_device failed");
+            }
+            clFinish(context->get_queue());
+            return;
+        }
+
+        if (src_cl && dst_cpu) {
+            cl_mem dev = src_cl->get_device_buffer();
+            if (!dev || !dst_cpu->m_data) {
+                POWERSERVE_LOG_ERROR("copy: invalid host/dev for shape-mismatch D2H");
+                return;
+            }
+            const size_t src_off = src_cl->get_base_offset();
+            if (!memory_pool->copy_device_to_host(dst_cpu->m_data, dev, src_bytes, src_off)) {
+                POWERSERVE_LOG_ERROR("copy: shape-mismatch D2H copy_device_to_host failed");
+            }
+            return;
+        }
+
+        if (src_cl && dst_cl) {
+            cl_mem src_dev = src_cl->get_device_buffer();
+            cl_mem dst_dev = dst_cl->get_device_buffer();
+            if (!src_dev || !dst_dev) {
+                POWERSERVE_LOG_ERROR("copy: invalid cl_mem for shape-mismatch D2D");
+                return;
+            }
+
+            const size_t src_off = src_cl->get_base_offset();
+            const size_t dst_off = dst_cl->get_base_offset();
+            if (src_off == 0 && dst_off == 0) {
+                if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {
+                    POWERSERVE_LOG_ERROR("copy: shape-mismatch D2D copy_device_to_device failed");
+                }
+                return;
+            }
+
+            std::vector<uint8_t> host(src_bytes);
+            if (!memory_pool->copy_device_to_host(host.data(), src_dev, src_bytes, src_off)) {
+                POWERSERVE_LOG_ERROR("copy: shape-mismatch D2H staging failed");
+                return;
+            }
+            if (!memory_pool->copy_host_to_device(dst_dev, host.data(), src_bytes, dst_off)) {
+                POWERSERVE_LOG_ERROR("copy: shape-mismatch H2D staging failed");
+            }
+            clFinish(context->get_queue());
+            return;
+        }
+
+        POWERSERVE_LOG_ERROR("copy: shape mismatch with unsupported buffer types");
         return;
     }
 
@@ -1888,18 +2102,75 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
     // H2D
     if (src_cpu && dst_cl) {
-        
         void* host = src_cpu->m_data;
         cl_mem dev = dst_cl->get_device_buffer();
         if (!host || !dev) {
             POWERSERVE_LOG_ERROR("H2D: invalid host/dev");
             return;
         }
-        if (!memory_pool->copy_host_to_device(dev, host, src_bytes, 0)) {
-            POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
+
+        const bool src_contig = is_contiguous(src, 4);
+        const bool dst_contig = is_contiguous(dst, 4);
+
+        // Fast-path: contiguous dst -> linear write
+        if (src_contig && dst_contig) {
+            const size_t dst_off = dst_cl->get_base_offset();  // bytes
+            if (!memory_pool->copy_host_to_device(dev, host, src_bytes, dst_off)) {
+                POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
+            }
+            clFinish(context->get_queue());
+            return;
         }
+
+
+        std::vector<uint8_t> host_contig;
+        const void* host_src = host;
+        if (!src_contig) {
+            host_contig.resize(src_bytes);
+            if (!pack_cpu_strided_to_contig(src, host_contig.data())) {
+                POWERSERVE_LOG_ERROR("H2D: failed to pack CPU strided tensor");
+                return;
+            }
+            host_src = host_contig.data();
+        }
+
+        if (dst_contig) {
+            const size_t dst_off = dst_cl->get_base_offset();  // bytes
+            if (!memory_pool->copy_host_to_device(dev, host_src, src_bytes, dst_off)) {
+                POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
+            }
+            clFinish(context->get_queue());
+            return;
+        }
+
+        // Slow-path: non-contiguous dst -> write to staging contig -> scatter on device
+        if (!is_cpy_kernel_supported(src->m_dtype) || !is_cpy_kernel_supported(dst->m_dtype)) {
+            POWERSERVE_LOG_ERROR("H2D: non-contiguous copy requires cpy kernel, unsupported dtype src={} dst={}",
+                                (int)src->m_dtype, (int)dst->m_dtype);
+            return;
+        }
+
+        Tensor staging = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
+                                        dst->m_dtype,
+                                        dst->m_shape);
+
+        // 1) write host -> staging (staging contiguous so raw write ok)
+        auto &staging_buf = staging.get<OpenCLBuffer>();
+        cl_mem staging_mem = staging_buf.get_device_buffer();
+        const size_t st_off = staging_buf.get_base_offset();
+        if (!memory_pool->copy_host_to_device(staging_mem, host_src, src_bytes, st_off)) {
+            POWERSERVE_LOG_ERROR("H2D: staging copy_host_to_device failed");
+            dump_backtrace();
+            std::abort();
+        }
+
+        // 2) scatter staging(contig) -> dst(strided) using cpy kernel
+        // so for scatter we must call the same kernel but swap args:
+        // dst is "dst", staging is "src".
+        cpy_tensor_cl(this, &staging, dst);
         return;
     }
+
 
     // D2H
     if (src_cl && dst_cpu) {
@@ -1909,22 +2180,87 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             POWERSERVE_LOG_ERROR("D2H: invalid host/dev");
             return;
         }
-        if (!memory_pool->copy_device_to_host(host, dev, src_bytes, 0)) {
-            POWERSERVE_LOG_ERROR("D2H: copy_device_to_host failed");
+
+        const bool src_contig = is_contiguous(src, 4);
+        const bool dst_contig = is_contiguous(dst, 4);
+
+        // Slow-path: non-contiguous src -> pack on device -> linear read
+        Tensor staging;
+        const Tensor* read_src = src;
+        if (!src_contig) {
+            if (!is_cpy_kernel_supported(src->m_dtype)) {
+                POWERSERVE_LOG_ERROR("D2H: non-contiguous copy requires cpy kernel, unsupported dtype={}",
+                                    (int)src->m_dtype);
+                return;
+            }
+
+            staging = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
+                                            dst->m_dtype,
+                                            dst->m_shape);
+
+            // pack: src(strided) -> staging(contig)
+            cpy_tensor_cl(this, src, &staging);
+
+            // staging must be contiguous
+            POWERSERVE_ASSERT(is_contiguous(&staging, 4));
+            read_src = &staging;
+        }
+
+        BaseBuffer& read_base = const_cast<Tensor*>(read_src)->get<BaseBuffer>();
+        auto* read_cl = dynamic_cast<OpenCLBuffer*>(&read_base);
+        if (!read_cl) {
+            POWERSERVE_LOG_ERROR("D2H: expected OpenCLBuffer for read_src");
+            return;
+        }
+        cl_mem read_mem = read_cl->get_device_buffer();
+
+        if (dst_contig) {
+            const size_t src_off = read_cl->get_base_offset();  // bytes
+            if (!memory_pool->copy_device_to_host(host, read_mem, src_bytes, src_off)) {
+                POWERSERVE_LOG_ERROR("D2H: copy_device_to_host failed");
+            }
+            return;
+        }
+
+
+        std::vector<uint8_t> host_contig(src_bytes);
+        const size_t src_off = read_cl->get_base_offset();  // bytes
+        if (!memory_pool->copy_device_to_host(host_contig.data(), read_mem, src_bytes, src_off)) {
+            POWERSERVE_LOG_ERROR("D2H: staging copy_device_to_host failed");
+            return;
+        }
+
+        if (!unpack_contig_to_cpu_strided(host_contig.data(), dst)) {
+            POWERSERVE_LOG_ERROR("D2H: failed to unpack to CPU strided tensor");
         }
         return;
     }
 
     // D2D
     if (src_cl && dst_cl) {
+        
+        const size_t src_off = src_cl->get_base_offset();  // bytes
+        const size_t dst_off = dst_cl->get_base_offset();  // bytes
+
         cl_mem src_dev = src_cl->get_device_buffer();
         cl_mem dst_dev = dst_cl->get_device_buffer();
         if (!src_dev || !dst_dev) {
             POWERSERVE_LOG_ERROR("D2D: invalid cl_mem");
             return;
         }
+        if (src_off != 0 || dst_off != 0 || !is_contiguous(src, 4) || !is_contiguous(dst, 4)) {
+            if (!is_cpy_kernel_supported(src->m_dtype) || !is_cpy_kernel_supported(dst->m_dtype)) {
+                POWERSERVE_LOG_ERROR("D2D: non-trivial copy requires cpy kernel, unsupported dtype src={} dst={}",
+                                    (int)src->m_dtype, (int)dst->m_dtype);
+                return;
+            }
+            cpy_tensor_cl(this, src, dst);
+            return;
+        }
         if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {
             POWERSERVE_LOG_ERROR("D2D: copy_device_to_device failed");
+            dump_backtrace();
+            std::abort();
         }
         return;
     }
@@ -1938,6 +2274,66 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
     POWERSERVE_LOG_ERROR("copy: unsupported src/dst buffer types");
 }
 
+void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
+    if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
+    if (!out || !x)   POWERSERVE_ABORT("cont got null tensor");
+
+    POWERSERVE_ASSERT(is_contiguous(out, 4));
+
+    const size_t x_bytes   = ggml_compat_nbytes(x->m_dtype, x->m_shape);
+    const size_t out_bytes = ggml_compat_nbytes(out->m_dtype, out->m_shape);
+    if (x_bytes == 0 || out_bytes == 0 || x_bytes != out_bytes) {
+        POWERSERVE_ABORT("cont: nbytes mismatch x_bytes={} out_bytes={}", x_bytes, out_bytes);
+    }
+
+    // 如果 x 已经 contiguous，copy 就够了（copy 支持 shape 不同但 nbytes 相同）
+    if (is_contiguous(x, 4)) {
+        this->copy(out, x);
+        return;
+    }
+
+    // --- Step 1: 先把 x(strided) pack 成 contiguous 的 tmp（shape 必须与 x 相同） ---
+    Tensor tmp = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
+                                        x->m_dtype,
+                                        x->m_shape);   // contiguous + same shape as x
+    cpy_tensor_cl(this, x, &tmp); 
+
+    // --- Step 2: 把 tmp 的连续字节搬到 out（shape 可以不同，只要 nbytes 相同） ---
+    // 获取 OpenCLBuffer
+    auto *tmp_cl = dynamic_cast<OpenCLBuffer*>(&tmp.get<BaseBuffer>());
+    auto *out_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(out)->get<BaseBuffer>());
+    if (!tmp_cl || !out_cl) {
+        POWERSERVE_ABORT("cont: expected OpenCLBuffer for tmp/out");
+    }
+
+    cl_mem src_dev = tmp_cl->get_device_buffer();
+    cl_mem dst_dev = out_cl->get_device_buffer();
+    if (!src_dev || !dst_dev) {
+        POWERSERVE_ABORT("cont: invalid cl_mem src_dev/dst_dev");
+    }
+
+    const size_t src_off = tmp_cl->get_base_offset(); 
+    const size_t dst_off = out_cl->get_base_offset(); 
+
+    // 快路径：两边 offset 都是 0 → 直接 D2D memcpy
+    if (src_off == 0 && dst_off == 0) {
+        if (!memory_pool->copy_device_to_device(dst_dev, src_dev, x_bytes)) {
+            POWERSERVE_ABORT("cont: copy_device_to_device failed");
+        }
+        return;
+    }
+
+    // 慢路径但正确：D2H + H2D（支持 offset）
+    std::vector<uint8_t> host(x_bytes);
+    if (!memory_pool->copy_device_to_host(host.data(), src_dev, x_bytes, src_off)) {
+        POWERSERVE_ABORT("cont: copy_device_to_host failed");
+    }
+    if (!memory_pool->copy_host_to_device(dst_dev, host.data(), x_bytes, dst_off)) {
+        POWERSERVE_ABORT("cont: copy_host_to_device failed");
+    }
+    clFinish(context->get_queue());
+}
+
 void OpenCLBackend::print(const Tensor* x, size_t size) const {
     POWERSERVE_ABORT("OpenCLBackend::print TODO");
 }
@@ -1947,12 +2343,20 @@ void OpenCLBackend::reset_kv_batch_size(const size_t batch_size) const {
         POWERSERVE_LOG_ERROR("reset_kv_batch_size called but KVCache not allocated");
         return;
     }
-    if (batch_size != 1) {
-        POWERSERVE_LOG_ERROR("KVCache v0 only supports batch_size=1, got {}", batch_size);
+    if (batch_size == 0) {
+        POWERSERVE_LOG_ERROR("KVCache v0 expects batch_size > 0");
         return;
     }
-    m_kv->batch_size = 1;
-    m_kv->position = 0;
+        if (m_kv->batch_size == batch_size && m_kv->positions.size() == batch_size) {
+        return;
+    }
+    std::vector<size_t> new_positions(batch_size, 0);
+    const size_t copy_count = std::min(batch_size, m_kv->positions.size());
+    for (size_t i = 0; i < copy_count; ++i) {
+        new_positions[i] = m_kv->positions[i];
+    }
+    m_kv->positions = std::move(new_positions);
+    m_kv->batch_size = batch_size;
 }
 
 void OpenCLBackend::add_cache(const Tensor *k,
@@ -1964,99 +2368,156 @@ void OpenCLBackend::add_cache(const Tensor *k,
 
     if (!m_kv) { POWERSERVE_LOG_ERROR("add_cache: KVCache not allocated"); return; }
     if (!k || !v) { POWERSERVE_LOG_ERROR("add_cache: null tensor"); return; }
-    if (m_kv->batch_size != 1 || pos.size() != 1) {
-        POWERSERVE_LOG_ERROR("add_cache v0 expects batch=1 and pos.size()==1");
+
+    if (pos.empty()) {
+        POWERSERVE_LOG_ERROR("add_cache v0 expects non-empty pos");
         return;
     }
+
+    if (pos.size() != m_kv->batch_size) {
+        POWERSERVE_LOG_ERROR("add_cache v0 expects pos.size()==batch_size, got pos.size()={} batch_size={}",
+                             pos.size(), m_kv->batch_size);
+        return;
+    }
+
     if (L >= m_kv->key.size()) {
         POWERSERVE_LOG_ERROR("add_cache: invalid layer {}", L);
         return;
     }
-    if (m_kv->position >= m_kv->max_seq_len) {
-        POWERSERVE_LOG_ERROR("KVCache overflow: position {} max_seq_len {}", m_kv->position, m_kv->max_seq_len);
-        return;
-    }
+
     if (k->m_dtype != DataType::FP32 || v->m_dtype != DataType::FP32) {
         POWERSERVE_LOG_ERROR("add_cache v0 only supports FP32");
         return;
     }
 
     const size_t kv_dim = m_kv->kv_dim;
-    // Expect token shape {kv_dim, 1, 1, 1}
-    if (k->m_shape[0] != kv_dim || k->m_shape[1] != 1 || k->m_shape[2] != 1 || k->m_shape[3] != 1 ||
-        v->m_shape[0] != kv_dim || v->m_shape[1] != 1 || v->m_shape[2] != 1 || v->m_shape[3] != 1) {
-        POWERSERVE_LOG_ERROR("add_cache shape mismatch: expect {{kv_dim,1,1,1}}");
+    const size_t batch_size = pos.size();
+
+    // Expect token shape {kv_dim, batch_size, 1, 1}
+    if (k->m_shape[0] != kv_dim || k->m_shape[1] != batch_size || k->m_shape[2] != 1 || k->m_shape[3] != 1 ||
+        v->m_shape[0] != kv_dim || v->m_shape[1] != batch_size || v->m_shape[2] != 1 || v->m_shape[3] != 1) {
+        POWERSERVE_LOG_ERROR("add_cache shape mismatch: expect {{kv_dim, batch_size,1,1}} (kv_dim={}, batch_size={})",
+                             kv_dim, batch_size);
         return;
     }
 
-    const size_t cur = m_kv->position;
+    // ---- offset：bytes；create_buffer_view 会把 offset 加到 parent.base_offset 上（Scheme-B） ----
+    const size_t token_bytes = kv_dim * sizeof(float);
+    const size_t batch_stride_bytes = token_bytes;
 
-    // Layout: cache is {kv_dim, max_seq_len} row-major (cols=kv_dim).
-    // Writing row=cur => offset in elements = cur * kv_dim
-    // !!! IMPORTANT: offset unit depends on create_buffer_view contract.
-    // If offset is in BYTES, use: cur*kv_dim*sizeof(float).
-    // If offset is in ELEMENTS, use: cur*kv_dim.
-    //
-    // From your earlier system rule ("offset encoded into cl_mem"), it is almost certainly BYTES.
-    const size_t offset = cur * kv_dim * sizeof(float);
-
-    // Create destination views (one token slice)
     Shape sTok{kv_dim, 1, 1, 1};
 
     try {
         auto &k_parent = *m_kv->key[L];
         auto &v_parent = *m_kv->value[L];
+        auto &k_src_parent = const_cast<Tensor *>(k)->get<OpenCLBuffer>();
+        auto &v_src_parent = const_cast<Tensor *>(v)->get<OpenCLBuffer>();
 
-        auto k_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(k_parent, sTok, offset);
-        auto v_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(v_parent, sTok, offset);
+        for (size_t b = 0; b < batch_size; ++b) {
+            if (pos[b] < 0) {
+                POWERSERVE_LOG_ERROR("add_cache: invalid pos[{}]={}", b, pos[b]);
+                return;
+            }
+            const size_t slot = static_cast<size_t>(pos[b]);
+            if (slot >= m_kv->max_seq_len) {
+                POWERSERVE_LOG_ERROR("KVCache overflow: slot {} max_seq_len {}", slot, m_kv->max_seq_len);
+                return;
+            }
 
-        if (!k_view || !v_view) {
-            POWERSERVE_LOG_ERROR("add_cache: create_buffer_view failed");
-            return;
-        }
+            const size_t dst_offset = slot * token_bytes;
+            const size_t src_offset = b * batch_stride_bytes;
 
-        Tensor t_dst_k(DataType::FP32, sTok);
-        Tensor t_dst_v(DataType::FP32, sTok);
-        t_dst_k.m_data = k_view;
-        t_dst_v.m_data = v_view;
+            if (dst_offset + token_bytes > k_parent.get_size()) {
+                POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] K view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
+                                     L, slot, dst_offset, token_bytes, k_parent.get_size());
+                return;
+            }
+            if (dst_offset + token_bytes > v_parent.get_size()) {
+                POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] V view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
+                                     L, slot, dst_offset, token_bytes, v_parent.get_size());
+                return;
+            }
 
-        this->copy(&t_dst_k, k); // D2D
-        this->copy(&t_dst_v, v); // D2D
+            auto k_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(k_parent, sTok, dst_offset);
+            auto v_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(v_parent, sTok, dst_offset);
+            auto k_src_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(k_src_parent, sTok, src_offset);
+            auto v_src_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(v_src_parent, sTok, src_offset);
+            if (!k_view || !v_view || !k_src_view || !v_src_view) {
+                POWERSERVE_LOG_ERROR("add_cache: create_buffer_view failed (L={}, slot={}, b={})", L, slot, b);
+                return;
+            }
+
+            Tensor t_dst_k(DataType::FP32, sTok);
+            Tensor t_dst_v(DataType::FP32, sTok);
+            Tensor t_src_k(DataType::FP32, sTok);
+            Tensor t_src_v(DataType::FP32, sTok);
+            t_dst_k.m_data = k_view;
+            t_dst_v.m_data = v_view;
+            t_src_k.m_data = k_src_view;
+            t_src_v.m_data = v_src_view;
+
+            this->copy(&t_dst_k, &t_src_k);
+            this->copy(&t_dst_v, &t_src_v);
+            
+            if (kv_dbg_enabled() && b == 0) {
+                Tensor host_k(DataType::FP32, Shape{8,1,1,1});
+                host_k.m_data = powerserve::CPUBuffer::create_buffer<float>(Shape{8,1,1,1});
+                Tensor k_first8(DataType::FP32, Shape{8,1,1,1});
+                auto k_first8_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(*k_view, Shape{8,1,1,1}, /*offset=*/0);
+                k_first8.m_data = k_first8_view;
+                this->copy(&host_k, &k_first8);
+
+                auto &hb = host_k.get<powerserve::CPUBuffer>();
+                float *p = (float*)hb.m_data;
+                POWERSERVE_LOG_INFO("[KV][ADD_CACHE] L={} slot={} K_first8: {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}",
+                                    L, slot, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+            }
+
+            if (b < m_kv->positions.size()) {
+                m_kv->positions[b] = slot + 1;
+            }
+        }                
     } catch (const std::bad_cast &e) {
         POWERSERVE_LOG_ERROR("add_cache expects OpenCLBuffer in KVCache: {}", e.what());
         return;
     }
-
-    m_kv->position += 1;
 }
 
 void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
     POWERSERVE_ASSERT(out && x);
     POWERSERVE_ASSERT(out->m_data && x->m_data);
 
-    // Ensure input is OpenCLBuffer-backed
+    auto *out_nc = const_cast<Tensor *>(out);
+    auto *x_nc   = const_cast<Tensor *>(x);
+
+    OpenCLBuffer *xbuf = nullptr;
+    OpenCLBuffer *obuf = nullptr;
     try {
-        (void)const_cast<Tensor *>(x)->get<OpenCLBuffer>();
+        xbuf = &x_nc->get<OpenCLBuffer>();
     } catch (const std::bad_cast &e) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::transpose expects OpenCLBuffer input: {}", e.what());
         POWERSERVE_ABORT("transpose: input not OpenCLBuffer");
     }
 
-    // Share buffer object
-    auto *out_nc = const_cast<Tensor *>(out);
-    auto *x_nc   = const_cast<Tensor *>(x);
-    out_nc->m_data = x_nc->m_data;
+    if (!out_nc->m_data) {
+        auto view = OpenCLBuffer::create_buffer_view<float>(*xbuf, out_nc->m_shape, /*offset=*/0);
+        POWERSERVE_ASSERT(view && "transpose: failed to create OpenCL view buffer");
+        out_nc->m_data = std::static_pointer_cast<BaseBuffer>(view);
+    }
 
-    // Now both point to same OpenCLBuffer object
-    auto &xbuf = x_nc->get<OpenCLBuffer>();
-    auto &obuf = out_nc->get<OpenCLBuffer>();
+    try {
+        obuf = &out_nc->get<OpenCLBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::transpose expects OpenCLBuffer output: {}", e.what());
+        POWERSERVE_ABORT("transpose: output not OpenCLBuffer");
+    }
 
-    obuf.m_stride = xbuf.m_stride;
-    std::swap(obuf.m_stride[0], obuf.m_stride[1]);
+    obuf->m_stride = xbuf->m_stride;
+    std::swap(obuf->m_stride[0], obuf->m_stride[1]);
 }
 
-void OpenCLBackend::ensure_kv_cache_allocated_v0() {
-    // v0: batch fixed 1, FP32, prealloc
+void OpenCLBackend::ensure_kv_cache_allocated_v0(size_t batch_size) {
+    // v0: FP32, prealloc
     const int n_layers_i = m_llm.n_layers;
     const int seq_len_i  = m_llm.seq_len;   // n_ctx
     const int kv_dim_i   = m_llm.kv_dim;
@@ -2074,15 +2535,15 @@ void OpenCLBackend::ensure_kv_cache_allocated_v0() {
     if (!m_kv) m_kv = std::make_unique<powerserve::opencl::OpenCLKV>();
 
     // If already allocated with same spec, do nothing
-    if (m_kv->spec_matches(n_layers, kv_dim, max_seq_len)) {
+    if (m_kv->spec_matches(n_layers, kv_dim, max_seq_len, batch_size)) {
         return;
     }
 
     // (Re)allocate
     m_kv->kv_dim = kv_dim;
     m_kv->max_seq_len = max_seq_len;
-    m_kv->batch_size = 1;
-    m_kv->position = 0;
+    m_kv->batch_size = batch_size;
+    m_kv->positions.assign(batch_size, 0);
     m_kv->key.clear();
     m_kv->value.clear();
     m_kv->key.resize(n_layers);
@@ -2099,8 +2560,8 @@ void OpenCLBackend::ensure_kv_cache_allocated_v0() {
         }
     }
 
-    POWERSERVE_LOG_INFO("KVCache v0 allocated: layers={}, kv_dim={}, max_seq_len={}",
-                        n_layers, kv_dim, max_seq_len);
+    POWERSERVE_LOG_INFO("KVCache v0 allocated: layers={}, kv_dim={}, max_seq_len={}, batch_size={}",
+                        n_layers, kv_dim, max_seq_len, batch_size);
 }
 
 } // namespace powerserve::opencl
