@@ -37,6 +37,9 @@ if(POWERSERVE_OPENCL_EMBED_KERNELS)
     add_definitions(-DOPENCL_SOFTMAX_CL_AVAILABLE)
     add_definitions(-DOPENCL_ROPE_CL_AVAILABLE)
     add_definitions(-DOPENCL_DIAG_MASK_INF_CL_AVAILABLE)
+    add_definitions(-DOPENCL_MUL_MAT_Q4_0_F32_SIMPLE_CL_AVAILABLE)
+    add_definitions(-DOPENCL_MUL_MAT_Q8_0_F32_SIMPLE_CL_AVAILABLE)
+    add_definitions(-DOPENCL_GET_ROWS_CL_AVAILABLE)
     # 添加你需要的其他内核
 endif()
 
