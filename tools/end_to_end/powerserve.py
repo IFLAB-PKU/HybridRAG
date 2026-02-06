@@ -115,7 +115,7 @@ def compile_binary():
         f'socks_proxy={os.environ.get("socks_proxy", "")}',
         "--network",
         "host",
-        "santoxin/mobile-build:v1.1",
+        "dongzhi61/rag.xpu:v1",
         "/bin/bash",
         "-c",
         "./tools/end_to_end/compile.sh",

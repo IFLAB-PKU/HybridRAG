@@ -16,7 +16,6 @@ check_command "pip"
 
 # echo -e "\033[36mChecking if the needed PowerServe docker image was updated...\033[0m"
 # don not show stderr or stdout
-sudo docker pull santoxin/mobile-build:v1.1 &> /dev/null
 
 # Check whether now locates at .../PowerServe
 if [ ! -d "tools" ]; then
