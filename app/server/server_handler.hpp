@@ -664,7 +664,8 @@ inline ModelOutput blocking_inference(
      * Prefill
      */
     Timer timer;
-    const size_t num_prefill_token = tokenizer.tokenize(input_prompt, tokenizer.m_vocab.tokenizer_add_bos).size() - 1;
+    bool add_special_tokens = tokenizer.m_vocab.tokenizer_add_bos || tokenizer.m_vocab.tokenizer_add_eos;
+    const size_t num_prefill_token = tokenizer.tokenize(input_prompt,add_special_tokens).size() - 1;
     bool end_of_text               = false;
 
     std::shared_ptr<powerserve::TokenIterator> iter = nullptr;
@@ -746,7 +747,9 @@ inline ModelOutput blocking_embedding(
      */
     Timer timer;
     // [FIX] Use `tokenizer.m_vocab.tokenizer_add_eos` as 2nd param for `tokenize`
-    std::vector<powerserve::Token> tokens = tokenizer.tokenize(input_prompt, tokenizer.m_vocab.tokenizer_add_eos);
+    bool add_special_tokens = tokenizer.m_vocab.tokenizer_add_bos || tokenizer.m_vocab.tokenizer_add_eos;
+    std::vector<powerserve::Token> tokens = tokenizer.tokenize(input_prompt, add_special_tokens);
+    POWERSERVE_LOG_DEBUG("Tokenized input :{}", tokens);
     const size_t num_tokens = tokens.size();
 
     std::vector<float> embedding_vector;
