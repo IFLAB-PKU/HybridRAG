@@ -367,7 +367,7 @@ class LlamaAttention(nn.Module):
         wo = torch.empty(self.embed_dim, self.embed_dim, dtype=torch.float32, device=self.device)
         ### lsh 修改
         if "qwen3" in self.model_name:
-            wo = torch.empty(self.embed_dim, 2*self.embed_dim, dtype=torch.float32, device=self.device)
+            wo = torch.empty(self.embed_dim, self.head_dim * self.n_heads, dtype=torch.float32, device=self.device)
         ###
         loader.load(wo, f"model.layers.{self.layer_id}.self_attn.o_proj.weight")
         o_heads = wo.reshape(self.embed_dim, self.n_heads, self.head_dim)
