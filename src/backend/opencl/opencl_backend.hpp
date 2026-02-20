@@ -13,7 +13,6 @@
 
 #include "core/config.hpp"
 #include "core/tensor.hpp"
-#include "core/thread_pool.hpp"
 #include "graph/node.hpp"
 
 #include <cstddef>
@@ -29,11 +28,6 @@ namespace powerserve::opencl {
 struct OpenCLBackend final : powerserve::Backend {
 public:
     // ========= Backup carried structs (helpers) =========
-    struct WorkData {
-        std::vector<char> buffer;
-        size_t size = 0;
-    };
-
     // 旧 rope 参数结构：保留给内部 kernel/兼容层使用（不是 Backend 接口）
     struct RopeParams {
         int n_past     = 0;
@@ -56,18 +50,14 @@ public:
 
     // backup (optional, keep if you still use them)
     std::shared_ptr<OpenCLKernelManager> kernel_manager;
-    std::unique_ptr<ThreadPool> thread_pool;
     std::shared_ptr<OpenCLMemoryPool> memory_pool;
     std::shared_ptr<OpenCLContext> context;
 
     // work/config/state (backup)
-    WorkData work_data;
-    std::vector<ThreadConfig> thread_config;
     std::string device_preference;
     bool initialized = false;
 
     // current
-    int num_threads = 1;
 
 public:
     explicit OpenCLBackend(const ModelConfig::LLMConfig &config, const HyperParams &hparams);
@@ -109,6 +99,8 @@ public:
         float max_bias
     ) const override;
 
+    void get_mask(const Tensor *out, const std::vector<int> &pos) const;
+
     void silu_hadamard(const Tensor *out, const Tensor *hb, const Tensor *hb2) const override;
     void copy(const Tensor *dst, const Tensor *src) const override;
 
@@ -133,10 +125,10 @@ public:
 
     // 张量属性检查 / 并行任务估算（如果还需要）
     bool is_contiguous(const Tensor *tensor, int n) const;
-    enum ggml_type get_vec_dot_type(const Tensor *tensor);
 
     // buffer 创建
     std::shared_ptr<OpenCLBuffer> create_buffer(Shape shape, DataType dtype) const;
+    std::shared_ptr<OpenCLBuffer> get_or_create_resident_buffer(const Tensor *src) const;
 
     bool is_initialized() const { return initialized; }
 
@@ -155,20 +147,6 @@ public:
 #endif
 
 private:
-    // ========= Internal helpers =========
-    void setup_default_config();
-
-    // matmul helper
-    void matmul_cpu_ggml_fallback(
-        const Tensor *dst,
-        const Tensor *src0,
-        const Tensor *src1
-    ) const;
-
-private:
-    // Tensor -> OpenCL buffer mapping (legacy path; if you已经把 buffer 放在 Tensor 内部，可逐步淘汰)
-    mutable std::unordered_map<const Tensor *, cl_mem> tensor_buffers_;
-    mutable std::mutex buffer_mutex_;
 
     // ---- GGML reusable fallback executor for CPU ops (matmul etc.) ----
     mutable std::unique_ptr<powerserve::ggml::GGMLBackend> m_ggml_fallback;
@@ -212,6 +190,39 @@ private:
 
     mutable std::unordered_map<QuantSplitKey, QuantSplitBuffers, QuantSplitKeyHash, QuantSplitKeyEq> m_quant_split_cache;
     mutable std::mutex m_quant_split_mutex;
+
+    struct ResidentBufferKey {
+        const BaseBuffer *host_buf = nullptr;
+        DataType dtype = DataType::FP32;
+        Shape shape{};
+        Stride stride{};
+    };
+
+    struct ResidentBufferKeyHash {
+        size_t operator()(const ResidentBufferKey &k) const noexcept {
+            size_t h = std::hash<const void *>{}(k.host_buf);
+            auto mix = [&](size_t v) {
+                h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
+            mix(std::hash<int>{}((int)k.dtype));
+            for (int i = 0; i < (int)k.shape.size(); ++i) mix(std::hash<size_t>{}(k.shape[i]));
+            for (int i = 0; i < (int)k.stride.size(); ++i) mix(std::hash<size_t>{}(k.stride[i]));
+            return h;
+        }
+    };
+
+    struct ResidentBufferKeyEq {
+        bool operator()(const ResidentBufferKey &a, const ResidentBufferKey &b) const noexcept {
+            return a.host_buf == b.host_buf &&
+                   a.dtype == b.dtype &&
+                   a.shape == b.shape &&
+                   a.stride == b.stride;
+        }
+    };
+
+    mutable std::unordered_map<ResidentBufferKey, std::shared_ptr<OpenCLBuffer>, ResidentBufferKeyHash, ResidentBufferKeyEq>
+        m_resident_buffers;
+    mutable std::mutex m_resident_buffers_mutex;
 
     QuantSplitBuffers get_or_create_split_q4_0(const Tensor* w) const;
     QuantSplitBuffers get_or_create_split_q8_0(const Tensor* w) const;

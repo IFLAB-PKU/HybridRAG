@@ -86,9 +86,9 @@ def get_soc():
 
 
 def compile_binary():
-    if not check_network_connectivity("https://github.com"):
-        print("\033[31mGitHub is not reachable. Please check your internet connection.\033[0m")
-        sys.exit(1)
+    # if not check_network_connectivity("https://github.com"):
+    #     print("\033[31mGitHub is not reachable. Please check your internet connection.\033[0m")
+    #     sys.exit(1)
 
     print("\033[36mDownloading submodules from GitHub\033[0m")
     subprocess.run(["git", "submodule", "update", "--init", "--recursive"], check=True)

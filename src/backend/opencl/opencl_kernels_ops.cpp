@@ -8,6 +8,8 @@
 #include <CL/cl.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -39,42 +41,32 @@ static inline bool device_supports_fp64(cl_device_id dev) {
     return ext.find("cl_khr_fp64") != std::string::npos || ext.find("cl_amd_fp64") != std::string::npos;
 }
 
-static inline powerserve::BufferPtr create_cpu_buffer_for_dtype(powerserve::DataType dt,
-                                                                const powerserve::Shape &shape) {
-    using powerserve::CPUBuffer;
-
-    switch (dt) {
-    case powerserve::DataType::FP32:
-        return CPUBuffer::create_buffer<float>(shape);
-    case powerserve::DataType::FP16:
-        return CPUBuffer::create_buffer<uint16_t>(shape);
-    case powerserve::DataType::INT32:
-        return CPUBuffer::create_buffer<int32_t>(shape);
-    case powerserve::DataType::INT64:
-        return CPUBuffer::create_buffer<int64_t>(shape);
-
-    // ===== Quantized GGML buffers (match ggml nb[] layout) =====
-    case powerserve::DataType::GGML_Q4_0:
-    case powerserve::DataType::GGML_Q8_0: {
-        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
-
-        powerserve::Stride stride{};
-        stride[0] = (size_t) ggml_type_size(gt);
-        stride[1] = (size_t) ggml_row_size(gt, (int64_t) shape[0]);
-        stride[2] = stride[1] * (size_t) shape[1];
-        stride[3] = stride[2] * (size_t) shape[2];
-
-        const size_t bytes = stride[3] * (size_t) shape[3];
-        void *ptr = malloc(bytes);
-        POWERSERVE_ASSERT(ptr && "malloc failed for quant CPU buffer");
-
-        return std::make_shared<CPUBuffer>(stride, ptr, /*allocated_by_malloc=*/true);
+static inline bool device_has_extension(cl_device_id dev, const char * ext_name) {
+    size_t n = 0;
+    if (clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &n) != CL_SUCCESS || n == 0) {
+        return false;
     }
-
-    default:
-        POWERSERVE_ABORT("create_cpu_buffer_for_dtype: unsupported dtype {}", (int)dt);
+    std::string ext(n, '\0');
+    if (clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, n, ext.data(), nullptr) != CL_SUCCESS) {
+        return false;
     }
+    return ext.find(ext_name) != std::string::npos;
 }
+
+static inline int preferred_subgroup_width(cl_device_id dev) {
+    if (device_has_extension(dev, "cl_intel_required_subgroup_size") ||
+        device_has_extension(dev, "cl_intel_subgroups")) {
+        return 16;
+    }
+    return 64;
+}
+
+constexpr bool kDisableMatmulFastQ4_0_8x = false;
+constexpr bool kDisableMatmulFastQ8_0Gemm = false;
+constexpr bool kDisableMatmulFastQ8_0Mv = false;
+constexpr bool kDisableMatmulFastF16Gemm = false;
+constexpr bool kDisableMatmulFastF32Gemm = false;
+constexpr bool kAlignQ8FastInputX = true;
 
 void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor * src1) const {
     if (!initialized) {
@@ -162,10 +154,6 @@ void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor 
         return;
     }
 
-    err = clFinish(q);
-    if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
-    }
 }
 
 void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor *src1) const {
@@ -399,11 +387,6 @@ void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor 
             OCL_RETURN_IF_ERROR(ctx, err);
         }
 
-        err = clFinish(context->get_queue());
-        if (err != CL_SUCCESS) {
-            POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
-        }
-
     } catch (const std::bad_cast& e) {
         POWERSERVE_LOG_ERROR("Invalid buffer type for add: {}", e.what());
     } catch (const std::exception& e) {
@@ -536,10 +519,6 @@ void OpenCLBackend::matmul_minimal(Tensor * dst,
         return;
     }
 
-    err = clFinish(q);
-    if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
-    }
 }
 
 void OpenCLBackend::silu_hadamard(const Tensor * out,
@@ -608,10 +587,6 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
         POWERSERVE_ABORT("clEnqueueNDRangeKernel failed: {}", context->get_error_string(err));
     }
 
-    err = clFinish(q);
-    if (err != CL_SUCCESS) {
-        POWERSERVE_ABORT("clFinish failed: {}", context->get_error_string(err));
-    }
 }
 
 void OpenCLBackend::get_embedding(const Tensor *dst,
@@ -788,84 +763,6 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
     clReleaseEvent(write_event);
 }
 
-void OpenCLBackend::matmul_cpu_ggml_fallback(
-    const Tensor *dst,
-    const Tensor *src0,
-    const Tensor *src1
-) const {
-    auto is_cpu_tensor = [](const Tensor *t) -> bool {
-        return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
-    };
-
-    const Tensor *a_host = src0;
-    const Tensor *b_host = src1;
-
-    Tensor host_a;
-    Tensor host_b;
-
-    if (!is_cpu_tensor(src0)) {
-        host_a = Tensor(src0->m_dtype, src0->m_shape);
-        host_a.m_data = create_cpu_buffer_for_dtype(src0->m_dtype, src0->m_shape);
-        this->copy(&host_a, src0);
-        a_host = &host_a;
-    }
-
-    if (!is_cpu_tensor(src1)) {
-        host_b = Tensor(src1->m_dtype, src1->m_shape);
-        host_b.m_data = create_cpu_buffer_for_dtype(src1->m_dtype, src1->m_shape);
-        this->copy(&host_b, src1);   // supports quant bytes via ggml_compat_nbytes in opencl_tensor_ops.cpp
-        b_host = &host_b;
-    }
-
-    Tensor host_c(dst->m_dtype, dst->m_shape);
-    host_c.m_data = create_cpu_buffer_for_dtype(dst->m_dtype, dst->m_shape);
-
-    POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
-
-    const Tensor *w_host = a_host;
-    const Tensor *x_host = b_host;
-
-    const int64_t K_w = (int64_t)w_host->m_shape[0];
-    const int64_t N_w = (int64_t)w_host->m_shape[1];
-    const int64_t K_x = (int64_t)x_host->m_shape[0];
-    const int64_t M_x = (int64_t)x_host->m_shape[1];
-
-    const int64_t N_dst = (int64_t)dst->m_shape[0];
-    const int64_t M_dst = (int64_t)dst->m_shape[1];
-
-    if (!(K_w == K_x && N_w == N_dst && M_x == M_dst)) {
-        POWERSERVE_LOG_ERROR(
-            "matmul_cpu_ggml_fallback shape mismatch: "
-            "w=[K={},N={}] x=[K={},M={}] dst=[N={},M={}]",
-            (long long)K_w, (long long)N_w,
-            (long long)K_x, (long long)M_x,
-            (long long)N_dst, (long long)M_dst
-        );
-        POWERSERVE_ABORT("matmul_cpu_ggml_fallback: abort due to incompatible shapes (would trigger ggml assert)");
-    }
-
-    const size_t n_threads = (size_t)m_hparams.n_threads;
-    size_t required_wsize = sizeof(float) * (size_t)(K_w + 64) * n_threads;
-
-    {
-        const enum ggml_type vec_dot_type = m_ggml_fallback->get_vec_dot_type(x_host);
-        const enum ggml_type w_type       = powerserve::ggml::convert_datatype_to_ggml(w_host->m_dtype);
-        if (w_type != vec_dot_type) {
-            const size_t extra = (size_t)ggml_row_size(vec_dot_type, (int64_t)w_host->n_elements());
-            required_wsize = std::max(required_wsize, extra);
-        }
-    }
-
-    if (required_wsize > m_ggml_fallback_wsize) {
-        m_ggml_fallback->setup_work_data(required_wsize);
-        m_ggml_fallback_wsize = required_wsize;
-    }
-
-    m_ggml_fallback->matmul(&host_c, w_host, x_host);
-
-    this->copy(dst, &host_c);
-}
-
 OpenCLBackend::QuantSplitBuffers OpenCLBackend::get_or_create_split_q4_0(const Tensor* w) const {
     POWERSERVE_ASSERT(w != nullptr);
     POWERSERVE_ASSERT(w->m_dtype == DataType::GGML_Q4_0);
@@ -955,11 +852,12 @@ OpenCLBackend::QuantSplitBuffers OpenCLBackend::get_or_create_split_q8_0(const T
     key.base_offset = w_cl->get_base_offset();
     key.dtype       = w->m_dtype;
     key.shape       = w->m_shape;
-
     {
         std::lock_guard<std::mutex> lock(m_quant_split_mutex);
         auto it = m_quant_split_cache.find(key);
-        if (it != m_quant_split_cache.end()) return it->second;
+        if (it != m_quant_split_cache.end()) {
+            return it->second;
+        }
     }
 
     const int K  = (int)w->m_shape[0];
@@ -1025,13 +923,35 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
     auto* d_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(dst)->get<BaseBuffer>());
     POWERSERVE_ASSERT(w_cl && x_cl && d_cl);
 
-    // w: [K,N] (ggml), x: [K,M], dst: [N,M]
-    const int K = (int)w->m_shape[0];
-    const int N = (int)w->m_shape[1];
-    const int M = (int)x->m_shape[1];
+    const int ne00 = (int)w->m_shape[0];
+    const int ne01 = (int)w->m_shape[1];
+    const int ne02 = (int)w->m_shape[2];
+    const int ne03 = (int)w->m_shape[3];
 
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f16_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_f16_f32_simple not found (did you embed/compile mul_mat_f16_f32.cl?)");
+    const int ne10 = (int)x->m_shape[0];
+    const int ne11 = (int)x->m_shape[1];
+    const int ne12 = (int)x->m_shape[2];
+    const int ne13 = (int)x->m_shape[3];
+
+    const int ne0 = (int)dst->m_shape[0];
+    const int ne1 = (int)dst->m_shape[1];
+
+    const auto w_stride = w_cl->get_stride();
+    const auto x_stride = x_cl->get_stride();
+    const auto d_stride = d_cl->get_stride();
+
+    const cl_ulong nb00 = (cl_ulong)w_stride[0];
+    const cl_ulong nb01 = (cl_ulong)w_stride[1];
+    const cl_ulong nb02 = (cl_ulong)w_stride[2];
+    const cl_ulong nb03 = (cl_ulong)w_stride[3];
+
+    const cl_ulong nb10 = (cl_ulong)x_stride[0];
+    const cl_ulong nb11 = (cl_ulong)x_stride[1];
+    const cl_ulong nb12 = (cl_ulong)x_stride[2];
+    const cl_ulong nb13 = (cl_ulong)x_stride[3];
+
+    const int r2 = std::max(1, ne12 / std::max(1, ne02));
+    const int r3 = std::max(1, ne13 / std::max(1, ne03));
 
     cl_mem wmem  = w_cl->get_device_buffer();
     cl_mem xmem  = x_cl->get_device_buffer();
@@ -1041,34 +961,130 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
     const cl_ulong off_x  = (cl_ulong)x_cl->get_base_offset();
     const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
 
-    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
-    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
-    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
+    // 1) GEMM local-memory kernel.
+    if (!kDisableMatmulFastF16Gemm &&
+        is_contiguous(w, 4) && is_contiguous(x, 4) && ne00 % 16 == 0 && ne11 > 1) {
+        if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mm_f16_f32_l4_lm")) {
+            const int stride_a = ne10;
+            const int stride_b = ne10;
+            const int stride_d = ne01;
+            const int batch_stride_a = ne00 * ne01;
+            const int batch_stride_b = ne10 * ne11;
+            const int batch_stride_d = ne0 * ne1;
 
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
+            cl_uint arg = 0;
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne02));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_a));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_b));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_a));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_b));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r2));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r3));
 
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
+            const size_t local[3]  = { 128, 1, 1 };
+            const size_t global[3] = {
+                (size_t)(((ne01 + 63) / 64) * 128),
+                (size_t)((ne11 + 63) / 64),
+                (size_t)ne12 * (size_t)ne13
+            };
+            OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
+            return;
+        }
+    }
 
-    const size_t local[2]  = { 16, 16 };
+    // 2) GGML-style subgroup matvec kernels.
+    {
+        cl_kernel k = nullptr;
+        int nrows = 1;
+        if (ne11 * ne12 < 4) {
+            k = kernel_manager->get_kernel("kernel_mul_mat_f16_f32_1row");
+        } else if (ne00 >= 128 && ne01 >= 8 && ne00 % 4 == 0) {
+            k = kernel_manager->get_kernel("kernel_mul_mat_f16_f32_l4");
+            nrows = ne11;
+        }
 
-    const size_t global[2] = {
-        ((size_t)N + local[0] - 1) / local[0] * local[0],
-        ((size_t)M + local[1] - 1) / local[1] * local[1],
-    };
+        if (k) {
+            const int nth0 = preferred_subgroup_width(ctx->get_device());
+            const int nth1 = 1;
+            const int64_t ny = (ne11 + nrows - 1) / nrows;
 
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
+            cl_uint arg = 0;
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne02));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb00));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb01));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb02));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb03));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne10));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb10));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb13));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne0));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne1));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r2));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r3));
+
+            const size_t local[3]  = { (size_t)nth0, (size_t)nth1, 1 };
+            const size_t global[3] = {
+                (size_t)ne01 * (size_t)nth0,
+                (size_t)ny * (size_t)nth1,
+                (size_t)ne12 * (size_t)ne13
+            };
+            OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
+            return;
+        }
+    }
+
+    // 3) Existing tiled kernel path.
+    if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f16_f32")) {
+        const int A_rows = ne01;
+        const int B_rows = ne11;
+        const int K_dim  = ne00;
+
+        cl_uint arg = 0;
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &A_rows));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &B_rows));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K_dim));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+
+        const size_t local[2] = { 16, 8 };
+        const size_t global[2] = {
+            ((size_t)A_rows + 63) / 64 * local[0],
+            ((size_t)B_rows + 63) / 64 * local[1],
+        };
+
+        OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
+        return;
+    }
+
+    POWERSERVE_ABORT("matmul_opencl_f16_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -1080,49 +1096,119 @@ void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, c
     auto* d_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(dst)->get<BaseBuffer>());
     POWERSERVE_ASSERT(w_cl && x_cl && d_cl);
 
-    const int K = (int)w->m_shape[0];
-    const int N = (int)w->m_shape[1];
-    const int M = (int)x->m_shape[1];
+    const int ne00 = (int)w->m_shape[0]; // K
+    const int ne01 = (int)w->m_shape[1]; // N
+    const int ne02 = (int)w->m_shape[2];
+    const int ne03 = (int)w->m_shape[3];
 
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_q4_0_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_q4_0_f32_simple not found");
+    const int ne10 = (int)x->m_shape[0]; // K
+    const int ne11 = (int)x->m_shape[1]; // M
+    const int ne12 = (int)x->m_shape[2];
+    const int ne13 = (int)x->m_shape[3];
 
-    cl_mem wmem  = w_cl->get_device_buffer();
-    cl_mem xmem  = x_cl->get_device_buffer();
-    cl_mem out   = d_cl->get_device_buffer();
+    const int ne0 = (int)dst->m_shape[0]; // N
+    const int ne1 = (int)dst->m_shape[1]; // M
 
-    const cl_ulong off_w  = (cl_ulong)w_cl->get_base_offset();
-    const cl_ulong off_x  = (cl_ulong)x_cl->get_base_offset();
-    const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
+    POWERSERVE_ASSERT(ne12 % ne02 == 0);
+    POWERSERVE_ASSERT(ne13 % ne03 == 0);
+    const int r2 = ne12 / ne02;
+    const int r3 = ne13 / ne03;
 
-    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
-    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
-    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
+    cl_ulong off_x = (cl_ulong)x_cl->get_base_offset();
+    const cl_ulong off_d = (cl_ulong)d_cl->get_base_offset();
 
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+    // Optional parity mode: force x into ggml-like q8 quantize-dequantize path
+    // on GPU before entering q4 fast kernel.
+    Tensor x_qdq_dev;
+    if (kAlignQ8FastInputX) {
+        x_qdq_dev = Tensor(DataType::FP32, x->m_shape);
+        x_qdq_dev.m_data = this->create_buffer(x->m_shape, DataType::FP32);
+        POWERSERVE_ASSERT(x_qdq_dev.m_data);
 
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
+        cl_kernel k_align = kernel_manager->get_kernel("kernel_q8_align_x_f32");
+        POWERSERVE_ASSERT(k_align && "kernel_q8_align_x_f32 not found");
+        POWERSERVE_ASSERT((ne00 % 32) == 0 && "Q4 fast align expects K multiple of 32");
 
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
+        auto *x_qdq_cl = dynamic_cast<OpenCLBuffer *>(&x_qdq_dev.get<BaseBuffer>());
+        POWERSERVE_ASSERT(x_qdq_cl);
 
-    const size_t local[2]  = { 16, 16 };
-    const size_t global[2] = {
-        ((size_t)N + local[0] - 1) / local[0] * local[0],
-        ((size_t)M + local[1] - 1) / local[1] * local[1],
-    };
+        cl_mem src_mem = x_cl->get_device_buffer();
+        const cl_ulong off_src = off_x;
+        cl_mem dst_mem = x_qdq_cl->get_device_buffer();
+        const cl_ulong off_dst = (cl_ulong)x_qdq_cl->get_base_offset();
+        POWERSERVE_ASSERT(src_mem && dst_mem);
 
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
+        const int K = ne00;
+        const int M = ne11;
+
+        cl_uint arg_align = 0;
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_mem), &src_mem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_ulong), &off_src));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_mem), &dst_mem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_ulong), &off_dst));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(int), &K));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(int), &M));
+
+        const size_t local_align[2]  = { 32, 1 };
+        const size_t global_align[2] = {
+            (size_t)K,
+            (size_t)M,
+        };
+        OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k_align, 2, nullptr, global_align, local_align, 0, nullptr, nullptr));
+
+        x_cl = dynamic_cast<OpenCLBuffer *>(&x_qdq_dev.get<BaseBuffer>());
+        POWERSERVE_ASSERT(x_cl);
+        off_x = (cl_ulong)x_cl->get_base_offset();
+    }
+
+    // Prefer ggml-style split-q + flat kernel.
+    if (!kDisableMatmulFastQ4_0_8x) {
+        cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_q4_0_f32_8x_flat");
+        if (k) {
+        const auto split = get_or_create_split_q4_0(w);
+        POWERSERVE_ASSERT(split.q && split.d);
+
+        cl_mem qmem = split.q->get_device_buffer();
+        cl_mem dmem = split.d->get_device_buffer();
+        cl_mem xmem = x_cl->get_device_buffer();
+        cl_mem out  = d_cl->get_device_buffer();
+        POWERSERVE_ASSERT(qmem && dmem && xmem && out);
+
+        const int r2 = 1;
+        const int r3 = 1;
+
+        cl_uint arg = 0;
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &qmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &dmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne02));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne10));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne12));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne0));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne1));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r2));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r3));
+
+        const int nth0 = preferred_subgroup_width(ctx->get_device());
+        const int ndst = 8;
+        const size_t local[3]  = { (size_t)nth0, 1, 1 };
+        const size_t global[3] = {
+            (size_t)(((ne01 + ndst - 1) / ndst) * nth0),
+            (size_t)ne11,
+            (size_t)ne12 * (size_t)ne13
+        };
+
+        OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
+        return;
+        }
+    }
+
+    POWERSERVE_ABORT("matmul_opencl_q4_0_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -1134,49 +1220,269 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
     auto* d_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(dst)->get<BaseBuffer>());
     POWERSERVE_ASSERT(w_cl && x_cl && d_cl);
 
-    const int K = (int)w->m_shape[0];
-    const int N = (int)w->m_shape[1];
-    const int M = (int)x->m_shape[1];
+    const int ne00 = (int)w->m_shape[0]; // K
+    const int ne01 = (int)w->m_shape[1]; // N
+    const int ne02 = (int)w->m_shape[2];
+    const int ne03 = (int)w->m_shape[3];
 
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_q8_0_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_q8_0_f32_simple not found");
+    const int ne10 = (int)x->m_shape[0]; // K
+    const int ne11 = (int)x->m_shape[1]; // M
+    const int ne12 = (int)x->m_shape[2];
+    const int ne13 = (int)x->m_shape[3];
 
-    cl_mem wmem  = w_cl->get_device_buffer();
-    cl_mem xmem  = x_cl->get_device_buffer();
-    cl_mem out   = d_cl->get_device_buffer();
+    const int ne0 = (int)dst->m_shape[0]; // N
+    const int ne1 = (int)dst->m_shape[1]; // M
 
-    const cl_ulong off_w  = (cl_ulong)w_cl->get_base_offset();
-    const cl_ulong off_x  = (cl_ulong)x_cl->get_base_offset();
-    const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
+    POWERSERVE_ASSERT(ne12 % ne02 == 0);
+    POWERSERVE_ASSERT(ne13 % ne03 == 0);
+    const int r2 = ne12 / ne02;
+    const int r3 = ne13 / ne03;
 
-    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
-    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
-    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
+    cl_ulong off_x = (cl_ulong)x_cl->get_base_offset();
+    const cl_ulong off_d = (cl_ulong)d_cl->get_base_offset();
 
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+    const auto split = get_or_create_split_q8_0(w);
+    POWERSERVE_ASSERT(split.q && split.d);
 
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
+    cl_mem qmem = split.q->get_device_buffer();
+    cl_mem dmem = split.d->get_device_buffer();
+    cl_mem xmem = x_cl->get_device_buffer();
+    cl_mem out  = d_cl->get_device_buffer();
+    POWERSERVE_ASSERT(qmem && dmem && xmem && out);
 
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
+    const bool want_align = kAlignQ8FastInputX;
+    cl_kernel k_q8_intx = nullptr;
+    cl_kernel k_q8_quant = nullptr;
+    if (want_align) {
+        k_q8_intx = kernel_manager->get_kernel("kernel_mul_mv_q8_0_f32_intx_flat");
+        k_q8_quant = kernel_manager->get_kernel("kernel_q8_quantize_x_f32");
+    }
 
-    const size_t local[2]  = { 16, 16 };
-    const size_t global[2] = {
-        ((size_t)N + local[0] - 1) / local[0] * local[0],
-        ((size_t)M + local[1] - 1) / local[1] * local[1],
-    };
+    // Optional parity mode: force x into ggml-like q8 quantize-dequantize path
+    // on GPU before entering legacy q8 fast kernels.
+    Tensor x_qdq_dev;
+    if (want_align && !(k_q8_intx && k_q8_quant)) {
+        x_qdq_dev = Tensor(DataType::FP32, x->m_shape);
+        x_qdq_dev.m_data = this->create_buffer(x->m_shape, DataType::FP32);
+        POWERSERVE_ASSERT(x_qdq_dev.m_data);
 
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
+        cl_kernel k_align = kernel_manager->get_kernel("kernel_q8_align_x_f32");
+        POWERSERVE_ASSERT(k_align && "kernel_q8_align_x_f32 not found");
+        POWERSERVE_ASSERT((ne00 % 32) == 0 && "Q8 fast align expects K multiple of 32");
+
+        auto *x_qdq_cl = dynamic_cast<OpenCLBuffer *>(&x_qdq_dev.get<BaseBuffer>());
+        POWERSERVE_ASSERT(x_qdq_cl);
+
+        cl_mem src_mem = xmem;
+        const cl_ulong off_src = off_x;
+        cl_mem dst_mem = x_qdq_cl->get_device_buffer();
+        const cl_ulong off_dst = (cl_ulong)x_qdq_cl->get_base_offset();
+        POWERSERVE_ASSERT(src_mem && dst_mem);
+
+        const int K = ne00;
+        const int M = ne11;
+
+        cl_uint arg_align = 0;
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_mem), &src_mem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_ulong), &off_src));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_mem), &dst_mem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(cl_ulong), &off_dst));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(int), &K));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_align, arg_align++, sizeof(int), &M));
+
+        const size_t local_align[2]  = { 32, 1 };
+        const size_t global_align[2] = {
+            (size_t)K,
+            (size_t)M,
+        };
+        OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k_align, 2, nullptr, global_align, local_align, 0, nullptr, nullptr));
+
+        x_cl = dynamic_cast<OpenCLBuffer *>(&x_qdq_dev.get<BaseBuffer>());
+        POWERSERVE_ASSERT(x_cl);
+        xmem = x_cl->get_device_buffer();
+        POWERSERVE_ASSERT(xmem);
+        off_x = (cl_ulong)x_cl->get_base_offset();
+    }
+
+    // New parity-first fast path:
+    // x(fp32) -> q8 (x_q, x_d) once, then int-dot q8xq8 subgroup kernel.
+    if (want_align && k_q8_intx && k_q8_quant) {
+        auto x_q_buf = OpenCLBuffer::create_buffer<int8_t>(x->m_shape, memory_pool);
+        POWERSERVE_ASSERT(x_q_buf && x_q_buf->get_device_buffer());
+
+        const Shape x_d_shape = {
+            (size_t)(ne00 / 32),
+            (size_t)ne11,
+            (size_t)ne12,
+            (size_t)ne13
+        };
+        auto x_d_buf = OpenCLBuffer::create_buffer<uint16_t>(x_d_shape, memory_pool);
+        POWERSERVE_ASSERT(x_d_buf && x_d_buf->get_device_buffer());
+
+        const auto x_stride = x_cl->get_stride();
+        const cl_ulong nb11 = (cl_ulong)x_stride[1];
+        const cl_ulong nb12 = (cl_ulong)x_stride[2];
+        const cl_ulong nb13 = (cl_ulong)x_stride[3];
+
+        cl_mem xqmem = x_q_buf->get_device_buffer();
+        cl_mem xdmem = x_d_buf->get_device_buffer();
+        const cl_ulong off_xq = (cl_ulong)x_q_buf->get_base_offset();
+        const cl_ulong off_xd = (cl_ulong)x_d_buf->get_base_offset();
+
+        {
+            cl_uint arg = 0;
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_mem), &xmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_ulong), &off_x));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_mem), &xqmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_ulong), &off_xq));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_mem), &xdmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_ulong), &off_xd));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(int), &ne00));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(int), &ne11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(int), &ne12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(int), &ne13));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_ulong), &nb11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_ulong), &nb12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_quant, arg++, sizeof(cl_ulong), &nb13));
+
+            const size_t local_q[3]  = { 32, 1, 1 };
+            const size_t global_q[3] = {
+                (size_t)ne00,
+                (size_t)ne11,
+                (size_t)ne12 * (size_t)ne13
+            };
+            OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k_q8_quant, 3, nullptr, global_q, local_q, 0, nullptr, nullptr));
+        }
+
+        {
+            cl_uint arg = 0;
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_mem), &qmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_mem), &dmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_mem), &xqmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_ulong), &off_xq));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_mem), &xdmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_ulong), &off_xd));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_mem), &out));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_ulong), &off_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &ne00));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &ne01));
+            const auto w_stride = w_cl->get_stride();
+            const cl_ulong nb01 = (cl_ulong)w_stride[1];
+            const cl_ulong nb02 = (cl_ulong)w_stride[2];
+            const cl_ulong nb03 = (cl_ulong)w_stride[3];
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_ulong), &nb01));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_ulong), &nb02));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(cl_ulong), &nb03));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &ne11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &ne12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &ne0));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &ne1));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &r2));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k_q8_intx, arg++, sizeof(int), &r3));
+
+            const int nth0 = preferred_subgroup_width(ctx->get_device());
+            const int nth1 = 2;
+            const int ndst = nth1 * 4;
+            const size_t local[3]  = { (size_t)nth0, (size_t)nth1, 1 };
+            const size_t global[3] = {
+                (size_t)(((ne01 + ndst - 1) / ndst) * nth0),
+                (size_t)ne11 * (size_t)nth1,
+                (size_t)ne12 * (size_t)ne13
+            };
+            OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k_q8_intx, 3, nullptr, global, local, 0, nullptr, nullptr));
+            return;
+        }
+    }
+
+    // 1) Prefer ggml-style flat mv kernel for better numeric parity.
+    if (!kDisableMatmulFastQ8_0Mv) {
+        cl_kernel k = kernel_manager->get_kernel("kernel_mul_mv_q8_0_f32_flat");
+        if (k) {
+        const auto w_stride = w_cl->get_stride();
+        const auto x_stride = x_cl->get_stride();
+        const cl_ulong nb01 = (cl_ulong)w_stride[1];
+        const cl_ulong nb02 = (cl_ulong)w_stride[2];
+        const cl_ulong nb03 = (cl_ulong)w_stride[3];
+        const cl_ulong nb11 = (cl_ulong)x_stride[1];
+        const cl_ulong nb12 = (cl_ulong)x_stride[2];
+        const cl_ulong nb13 = (cl_ulong)x_stride[3];
+        cl_uint arg = 0;
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &qmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &dmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb01));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb02));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb03));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne12));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb11));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb12));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb13));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne0));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne1));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r2));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r3));
+
+        const int nth0 = preferred_subgroup_width(ctx->get_device());
+        const int nth1 = 2;
+        const int ndst = nth1 * 4;
+        const size_t local[3]  = { (size_t)nth0, (size_t)nth1, 1 };
+        const size_t global[3] = {
+            (size_t)(((ne01 + ndst - 1) / ndst) * nth0),
+            (size_t)ne11 * (size_t)nth1,
+            (size_t)ne12 * (size_t)ne13
+        };
+        OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
+        return;
+        }
+    }
+
+    // 2) GEMM-localmem kernel as secondary fast path.
+    if (!kDisableMatmulFastQ8_0Gemm && ne11 >= 32 && ne00 % 32 == 0) {
+        if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mm_q8_0_f32_l4_lm")) {
+            const int stride_a = ne10; // K
+            const int stride_b = ne10; // K
+            const int stride_d = ne01; // N
+            const int batch_stride_a = ne00 * ne01;
+            const int batch_stride_b = ne10 * ne11;
+            const int batch_stride_d = ne0 * ne1;
+            cl_uint arg = 0;
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &qmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &dmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne02));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_a));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_b));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_a));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_b));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r2));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r3));
+
+            const size_t local[3]  = { 128, 1, 1 };
+            const size_t global[3] = {
+                (size_t)(((ne01 + 63) / 64) * 128),
+                (size_t)((ne11 + 63) / 64),
+                (size_t)ne12 * (size_t)ne13
+            };
+            OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
+            return;
+        }
+    }
+
+    POWERSERVE_ABORT("matmul_opencl_q8_0_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -1188,12 +1494,35 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
     auto* d_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(dst)->get<BaseBuffer>());
     POWERSERVE_ASSERT(w_cl && x_cl && d_cl);
 
-    const int K = (int)w->m_shape[0];
-    const int N = (int)w->m_shape[1];
-    const int M = (int)x->m_shape[1];
+    const int ne00 = (int)w->m_shape[0];
+    const int ne01 = (int)w->m_shape[1];
+    const int ne02 = (int)w->m_shape[2];
+    const int ne03 = (int)w->m_shape[3];
 
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f32_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_f32_f32_simple not found");
+    const int ne10 = (int)x->m_shape[0];
+    const int ne11 = (int)x->m_shape[1];
+    const int ne12 = (int)x->m_shape[2];
+    const int ne13 = (int)x->m_shape[3];
+
+    const int ne0 = (int)dst->m_shape[0];
+    const int ne1 = (int)dst->m_shape[1];
+
+    const auto w_stride = w_cl->get_stride();
+    const auto x_stride = x_cl->get_stride();
+    const auto d_stride = d_cl->get_stride();
+
+    const cl_ulong nb00 = (cl_ulong)w_stride[0];
+    const cl_ulong nb01 = (cl_ulong)w_stride[1];
+    const cl_ulong nb02 = (cl_ulong)w_stride[2];
+    const cl_ulong nb03 = (cl_ulong)w_stride[3];
+
+    const cl_ulong nb10 = (cl_ulong)x_stride[0];
+    const cl_ulong nb11 = (cl_ulong)x_stride[1];
+    const cl_ulong nb12 = (cl_ulong)x_stride[2];
+    const cl_ulong nb13 = (cl_ulong)x_stride[3];
+
+    const int r2 = std::max(1, ne12 / std::max(1, ne02));
+    const int r3 = std::max(1, ne13 / std::max(1, ne03));
 
     cl_mem wmem  = w_cl->get_device_buffer();
     cl_mem xmem  = x_cl->get_device_buffer();
@@ -1203,34 +1532,94 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
     const cl_ulong off_x  = (cl_ulong)x_cl->get_base_offset();
     const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
 
-    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
-    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
-    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
+    // 1) GEMM local-memory kernel.
+    if (!kDisableMatmulFastF32Gemm &&
+        is_contiguous(w, 4) && is_contiguous(x, 4) && ne00 % 16 == 0 && ne11 > 1) {
+        if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mm_f32_f32_l4_lm")) {
+            const int stride_a = ne10;
+            const int stride_b = ne10;
+            const int stride_d = ne01;
+            const int batch_stride_a = ne00 * ne01;
+            const int batch_stride_b = ne10 * ne11;
+            const int batch_stride_d = ne0 * ne1;
 
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+            cl_uint arg = 0;
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne02));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne11));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne12));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_a));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_b));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &stride_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_a));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_b));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &batch_stride_d));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r2));
+            OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r3));
 
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
+            const size_t local[3]  = { 128, 1, 1 };
+            const size_t global[3] = {
+                (size_t)(((ne01 + 63) / 64) * 128),
+                (size_t)((ne11 + 63) / 64),
+                (size_t)ne12 * (size_t)ne13
+            };
+            OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
+            return;
+        }
+    }
 
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
+    // 2) GGML-style subgroup matvec kernel.
+    if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f32_f32")) {
+        const int nth0 = preferred_subgroup_width(ctx->get_device());
+        const int nth1 = 1;
+        const int nrows = 4;
+        const int64_t ny = (ne11 + nrows - 1) / nrows;
 
-    const size_t local[2]  = { 16, 16 };
-    const size_t global[2] = {
-        ((size_t)N + local[0] - 1) / local[0] * local[0],
-        ((size_t)M + local[1] - 1) / local[1] * local[1],
-    };
+        cl_uint arg = 0;
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne02));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb00));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb01));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb02));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb03));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne10));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne11));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne12));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb10));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb11));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb12));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb13));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne0));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne1));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r2));
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &r3));
 
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
+        const size_t local[3]  = { (size_t)nth0, (size_t)nth1, 1 };
+        const size_t global[3] = {
+            (size_t)ne01 * (size_t)nth0,
+            (size_t)ny * (size_t)nth1,
+            (size_t)ne12 * (size_t)ne13
+        };
+
+        OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
+        return;
+    }
+
+    POWERSERVE_ABORT("matmul_opencl_f32_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
@@ -1246,15 +1635,6 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
           src0->m_dtype == DataType::GGML_Q4_0 || src0->m_dtype == DataType::GGML_Q8_0)) {
         POWERSERVE_ABORT("OpenCLBackend::matmul: unsupported weight dtype {} (no ggml fallback)", (int)src0->m_dtype);
     }
-
-    // // fallback
-    // if (src0->m_dtype == DataType::FP32 || src0->m_dtype == DataType::GGML_Q8_0) {
-    //     if (!m_ggml_fallback) {
-    //         POWERSERVE_ABORT("OpenCLBackend::matmul: ggml fallback not initialized for FP32/Q8_0 alignment");
-    //     }
-    //     matmul_cpu_ggml_fallback(dst, src0, src1);
-    //     return;
-    // }
 
     // Shapes: w=[K,N], x=[K,M], dst=[N,M]
     const int K  = (int)src0->m_shape[0];
@@ -1305,7 +1685,6 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     // ---- Ensure src1 and dst are OpenCL buffers + contiguous when needed ----
     Tensor tmp_x_dev;
     Tensor tmp_dst_dev;
-
     const Tensor *x_use = src1;
     if (!is_contiguous(src1, 4)) {
         tmp_x_dev = Tensor(DataType::FP32, src1->m_shape);
@@ -1339,7 +1718,6 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     auto *x_buf = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(x_use)->get<BaseBuffer>());
     auto *d_buf = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(dst_use)->get<BaseBuffer>());
     POWERSERVE_ASSERT(w_buf && x_buf && d_buf);
-
     const Shape w_slice_shape{ w_dev->m_shape[0], w_dev->m_shape[1], 1, 1 };
     const Shape x_slice_shape{ x_use->m_shape[0], x_use->m_shape[1], 1, 1 };
     const Shape d_slice_shape{ dst_use->m_shape[0], dst_use->m_shape[1], 1, 1 };
@@ -1586,9 +1964,7 @@ void OpenCLBackend::rmsnorm(
         (size_t)ne02,
         (size_t)ne03
     };
-
     OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), kernel, 3, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 
     if (out_dev != o) {
         detail::cpy_tensor_cl(self, out_dev, o);
@@ -1672,24 +2048,14 @@ void OpenCLBackend::rope(
         return;
     }
 
-    Shape pos_shape{pos.size(), 1, 1, 1};
-    Tensor pos_host(DataType::INT32, pos_shape);
-    pos_host.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(pos_shape);
-    auto &pos_cpu = pos_host.get<powerserve::CPUBuffer>();
-    std::memcpy(pos_cpu.m_data, pos.data(), pos.size() * sizeof(int32_t));
-
-    Tensor pos_dev(DataType::INT32, pos_shape);
-    pos_dev.m_data = self->create_buffer(pos_shape, DataType::INT32);
-    if (!pos_dev.m_data) {
-        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to allocate pos buffer, fallback to CPU");
-        fallback_to_cpu();
-        return;
+    self->ensure_tokens_buffer(pos.size());
+    OpenCLBuffer *pos_cl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(self->m_tokens_mutex);
+        pos_cl = self->m_tokens_buffer.get();
     }
-    self->copy(&pos_dev, &pos_host);
-
-    auto *pos_cl = dynamic_cast<OpenCLBuffer *>(&pos_dev.get<BaseBuffer>());
     if (!pos_cl) {
-        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to create pos OpenCLBuffer, fallback to CPU");
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to prepare pos buffer, fallback to CPU");
         fallback_to_cpu();
         return;
     }
@@ -1825,22 +2191,178 @@ void OpenCLBackend::rope(
         static_cast<size_t>(ne03)
     };
 
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(
+    cl_event pos_write_event = nullptr;
+    const size_t pos_bytes = pos.size() * sizeof(int32_t);
+    cl_int pos_write_err = clEnqueueWriteBuffer(
+        ctx->get_queue(),
+        P_cl,
+        CL_FALSE,
+        off1,
+        pos_bytes,
+        pos.data(),
+        0,
+        nullptr,
+        &pos_write_event
+    );
+    if (pos_write_err != CL_SUCCESS) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to upload pos buffer, fallback to CPU: {}",
+                            ctx->get_error_string(pos_write_err));
+        fallback_to_cpu();
+        return;
+    }
+
+    const cl_uint wait_count = pos_write_event ? 1u : 0u;
+    const cl_event *wait_list = pos_write_event ? &pos_write_event : nullptr;
+    cl_int rope_launch_err = clEnqueueNDRangeKernel(
         ctx->get_queue(),
         kernel,
         3,
         nullptr,
         global,
         local,
-        0,
-        nullptr,
+        wait_count,
+        wait_list,
         nullptr
-    ));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
+    );
+    if (pos_write_event) clReleaseEvent(pos_write_event);
+    if (rope_launch_err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope kernel launch failed: {}",
+                             ctx->get_error_string(rope_launch_err));
+        return;
+    }
 }
 
 void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {
     POWERSERVE_ABORT("OpenCLBackend::softmax TODO");
+}
+
+void OpenCLBackend::get_mask(const Tensor *out, const std::vector<int> &pos) const {
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    if (!out) {
+        POWERSERVE_LOG_ERROR("get_mask: out is null");
+        return;
+    }
+    if (out->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("get_mask: only FP32 is supported");
+        return;
+    }
+    if (out->m_shape[2] != 1 || out->m_shape[3] != 1) {
+        POWERSERVE_LOG_ERROR("get_mask: expected out shape [n_kv, batch, 1, 1], got [{}, {}, {}, {}]",
+                             out->m_shape[0], out->m_shape[1], out->m_shape[2], out->m_shape[3]);
+        return;
+    }
+
+    const int n_kv = static_cast<int>(out->m_shape[0]);
+    const int batch_size = static_cast<int>(out->m_shape[1]);
+    if (batch_size <= 0 || n_kv <= 0) {
+        return;
+    }
+    if ((int)pos.size() != batch_size) {
+        POWERSERVE_LOG_ERROR("get_mask: pos.size() {} != batch_size {}", pos.size(), batch_size);
+        return;
+    }
+
+    auto *self = const_cast<OpenCLBackend *>(this);
+    auto *ctx = self->context.get();
+    if (!ctx || !self->kernel_manager) {
+        POWERSERVE_LOG_ERROR("get_mask: OpenCL context or kernel manager not initialized");
+        return;
+    }
+
+    auto *out_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(out)->get<BaseBuffer>());
+    if (!out_cl) {
+        POWERSERVE_LOG_ERROR("get_mask: out must be OpenCLBuffer");
+        return;
+    }
+
+    self->ensure_tokens_buffer((size_t)batch_size);
+
+    OpenCLBuffer *pos_cl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(self->m_tokens_mutex);
+        pos_cl = self->m_tokens_buffer.get();
+    }
+    if (!pos_cl) {
+        POWERSERVE_LOG_ERROR("get_mask: failed to prepare pos buffer");
+        return;
+    }
+
+    cl_mem out_mem = out_cl->get_device_buffer();
+    cl_mem pos_mem = pos_cl->get_device_buffer();
+    if (!out_mem || !pos_mem) {
+        POWERSERVE_LOG_ERROR("get_mask: invalid cl_mem");
+        return;
+    }
+
+    const cl_ulong off_out = static_cast<cl_ulong>(out_cl->get_base_offset());
+    const cl_ulong off_pos = static_cast<cl_ulong>(pos_cl->get_base_offset());
+
+    cl_event write_event = nullptr;
+    const size_t pos_bytes = (size_t)batch_size * sizeof(int32_t);
+    cl_int err = clEnqueueWriteBuffer(
+        ctx->get_queue(),
+        pos_mem,
+        CL_FALSE,
+        off_pos,
+        pos_bytes,
+        pos.data(),
+        0,
+        nullptr,
+        &write_event
+    );
+    if (err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("get_mask: failed to upload pos: {}", ctx->get_error_string(err));
+        return;
+    }
+
+    cl_kernel kernel = self->kernel_manager->get_kernel("kernel_get_mask_f32");
+    if (!kernel) {
+        POWERSERVE_LOG_ERROR("get_mask: kernel_get_mask_f32 not found");
+        clReleaseEvent(write_event);
+        return;
+    }
+
+    auto set_arg_checked = [&](cl_uint idx, size_t sz, const void *ptr) -> bool {
+        cl_int e = clSetKernelArg(kernel, idx, sz, ptr);
+        if (e != CL_SUCCESS) {
+            POWERSERVE_LOG_ERROR("get_mask: clSetKernelArg({}) failed: {}", idx, ctx->get_error_string(e));
+            clReleaseEvent(write_event);
+            return false;
+        }
+        return true;
+    };
+
+    cl_uint arg = 0;
+    if (!set_arg_checked(arg++, sizeof(cl_mem), &out_mem)) return;
+    if (!set_arg_checked(arg++, sizeof(cl_ulong), &off_out)) return;
+    if (!set_arg_checked(arg++, sizeof(cl_mem), &pos_mem)) return;
+    if (!set_arg_checked(arg++, sizeof(cl_ulong), &off_pos)) return;
+    if (!set_arg_checked(arg++, sizeof(int), &n_kv)) return;
+    if (!set_arg_checked(arg++, sizeof(int), &batch_size)) return;
+
+    const size_t global[2] = {
+        static_cast<size_t>(n_kv),
+        static_cast<size_t>(batch_size)
+    };
+    err = clEnqueueNDRangeKernel(
+        ctx->get_queue(),
+        kernel,
+        2,
+        nullptr,
+        global,
+        nullptr,
+        1,
+        &write_event,
+        nullptr
+    );
+    clReleaseEvent(write_event);
+    if (err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("get_mask: kernel launch failed: {}", ctx->get_error_string(err));
+        return;
+    }
 }
 
 void OpenCLBackend::softmax_ext(
@@ -1905,9 +2427,14 @@ void OpenCLBackend::softmax_ext(
         return;
     }
 
-    cl_kernel kernel = self->kernel_manager->get_kernel("kernel_soft_max");
+    const bool use_strict_softmax = false;
+    const char *softmax_kernel_name = use_strict_softmax
+        ? "kernel_soft_max_strict_backup"
+        : "kernel_soft_max";
+
+    cl_kernel kernel = self->kernel_manager->get_kernel(softmax_kernel_name);
     if (!kernel) {
-        POWERSERVE_LOG_ERROR("softmax_ext: kernel_soft_max not found");
+        POWERSERVE_LOG_ERROR("softmax_ext: {} not found", softmax_kernel_name);
         return;
     }
 
@@ -1979,8 +2506,12 @@ void OpenCLBackend::softmax_ext(
     const int n_head_log2_i = (int)n_head_log2;
     OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &n_head_log2_i));
 
-    const uint32_t local_cap = std::min<uint32_t>((uint32_t)ne00, 256u);
-    const size_t local_work_size = (size_t)(1u << floor_log2_u32(std::max(1u, local_cap)));
+    // Default path uses parallel reduction; strict mode is kept for parity/debug.
+    size_t local_work_size = 1;
+    if (!use_strict_softmax) {
+        const uint32_t cap = std::min<uint32_t>(64u, std::max<uint32_t>(1u, (uint32_t)ne00));
+        local_work_size = (size_t)(1u << floor_log2_u32(cap));
+    }
     const size_t local_mem_size = local_work_size * sizeof(float);
     OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, local_mem_size, nullptr));
 
@@ -1990,13 +2521,12 @@ void OpenCLBackend::softmax_ext(
         static_cast<size_t>(ne03)
     };
     const size_t local[3] = { local_work_size, 1, 1 };
-
     OCL_RETURN_IF_ERROR(context, clEnqueueNDRangeKernel(
         context->get_queue(), kernel,
         3, nullptr, global, local,
         0, nullptr, nullptr
     ));
-    OCL_RETURN_IF_ERROR(context, clFinish(context->get_queue()));
 }
 
 } // namespace powerserve::opencl
+

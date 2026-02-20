@@ -1,0 +1,19 @@
+# Keep each prompt on one line.
+# CORE: lower-divergence prompts for pass/fail gating.
+# STRESS: higher-divergence prompts for drift observation.
+
+# In recent years, the landscape of artificial intelligence has been significantly transformed by the advent of large language models (LLMs). Traditionally, these models have been deployed in cloud environments due to their computational demands. However, the emergence of on-edge LLMs is reshaping how AI can be utilized at the edge of networks, offering numerous advantages in terms of latency, privacy, and accessibility.
+
+# CORE (5)
+Translate to Chinese. Output exactly one sentence, no extra text: "Large models are useful, but deployment constraints matter."
+请翻译成英文，只输出一句话，不要解释：端侧推理可以降低延迟并提升隐私保护。
+请用中文做一个简短自我介绍，限制在 30 到 40 个字，只输出正文。
+Output JSON only with this exact key order and labels from {positive,negative,neutral}: {"s1":"...","s2":"...","s3":"..."} ; s1="I love this product.", s2="This is the worst update ever.", s3="The meeting is at 3 PM."
+Output exactly this token and nothing else: ACK
+
+# STRESS (5)
+Based on this passage, write a 3-sentence abstract (90-120 words) that explicitly covers latency, privacy, and energy tradeoffs: "In recent years, the landscape of artificial intelligence has been significantly transformed by the advent of large language models (LLMs). Traditionally, these models have been deployed in cloud environments due to their computational demands. However, the emergence of on-edge LLMs is reshaping how AI can be utilized at the edge of networks, offering numerous advantages in terms of latency, privacy, and accessibility."
+Provide exactly 8 bullet points comparing cloud AI vs edge AI; each bullet must start with either "Pro:" or "Con:" and include one concrete production example.
+You are a strict reviewer. Evaluate the claim "Bigger models are always better in production." Output exactly 4 sections with these headings: Verdict, Strongest Argument, Strongest Counterargument, Practical Recommendation.
+请用中文写一段 120-150 字分析：在手机端部署 LLM 的两个收益与两个风险，并给出一个可执行的折中方案。
+Given this incident timeline: 09:00 deploy v2.1, 09:07 error rate rises to 12%, 09:15 rollback starts, 09:22 error rate returns to 1.1%. Write a concise postmortem including root cause hypothesis, missing evidence, and exactly 3 follow-up actions.

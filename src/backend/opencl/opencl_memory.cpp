@@ -1,4 +1,4 @@
-// opencl_memory.cpp
+﻿// opencl_memory.cpp
 #include "opencl_memory.hpp"
 #include "core/logger.hpp"
 #include <algorithm>
@@ -15,7 +15,6 @@ OpenCLMemoryPool::~OpenCLMemoryPool() {
     POWERSERVE_LOG_DEBUG("OpenCLMemoryPool destroyed");
 }
 
-// 私有实现：实际分配内存
 cl_mem OpenCLMemoryPool::allocate_impl(size_t size, cl_mem_flags flags, bool update_stats) {
     if (size == 0) {
         POWERSERVE_LOG_WARN("Attempting to allocate zero-sized buffer, using size 1");
@@ -39,25 +38,25 @@ cl_mem OpenCLMemoryPool::allocate_impl(size_t size, cl_mem_flags flags, bool upd
     return buffer;
 }
 
-// 公共接口：分配内存（不池化）
+// Public API: allocate memory (non-pooled)
 cl_mem OpenCLMemoryPool::allocate(size_t size, cl_mem_flags flags) {
     size = align_size(size);
     return allocate_impl(size, flags, true);
 }
 
-// 公共接口：分配池化内存
+// Public API: allocate pooled memory
 cl_mem OpenCLMemoryPool::allocate_pooled(size_t size, cl_mem_flags flags) {
     size = align_size(size);
     
     std::unique_lock<std::mutex> lock(mutex_);
     
-    // 首先在内存池中寻找合适的块
+    // First, try to reuse a suitable free block from pool.
     cl_mem buffer = find_suitable_pool_entry(size);
     if (buffer) {
         return buffer;
     }
     
-    // 释放锁，分配新内存
+    // Release lock, then allocate a new block.
     lock.unlock();
     buffer = allocate_impl(size, flags, false);
     lock.lock();
@@ -67,11 +66,11 @@ cl_mem OpenCLMemoryPool::allocate_pooled(size_t size, cl_mem_flags flags) {
         return nullptr;
     }
     
-    // 更新统计信息
+    // Update memory statistics.
     total_allocated_ += size;
     update_peak_usage();
     
-    // 添加到内存池
+    // Add the new block into the memory pool.
     MemoryBlock block;
     block.buffer = buffer;
     block.size = size;
@@ -84,7 +83,7 @@ cl_mem OpenCLMemoryPool::allocate_pooled(size_t size, cl_mem_flags flags) {
 }
 
 cl_mem OpenCLMemoryPool::find_suitable_pool_entry(size_t size) {
-    // 使用最佳适配策略：找到最小但足够大的空闲块
+    // Best-fit strategy: find the smallest free block that fits.
     MemoryBlock* best_fit = nullptr;
     
     for (auto& block : memory_pool_) {
@@ -108,21 +107,21 @@ void OpenCLMemoryPool::free(cl_mem buffer) {
     
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // 查找buffer是否在池中
+    // Check whether this buffer belongs to pool.
     auto it = std::find_if(memory_pool_.begin(), memory_pool_.end(),
         [buffer](const MemoryBlock& block) {
             return block.buffer == buffer;
         });
     
     if (it != memory_pool_.end()) {
-        // 在池中：记录大小然后释放
+        // In pool: record size and release.
         size_t freed_size = it->size;
         clReleaseMemObject(buffer);
         memory_pool_.erase(it);
         total_allocated_ -= freed_size;
         
     } else {
-        // 不在池中：直接释放
+        // Not in pool: release directly.
         clReleaseMemObject(buffer);
     }
 }
@@ -139,7 +138,7 @@ void OpenCLMemoryPool::free_pooled(cl_mem buffer) {
         }
     }
     
-    // 如果不在池中，记录警告
+    // Warn if buffer is not found in pool.
     POWERSERVE_LOG_WARN("Attempted to free_pooled a buffer not in pool");
     clReleaseMemObject(buffer);
 }
@@ -199,10 +198,6 @@ bool OpenCLMemoryPool::copy_host_to_device(cl_mem dst, const void* src, size_t s
                                   offset, size, src, 0, nullptr, nullptr);
     if (!context_->check_error(err, "clEnqueueWriteBuffer")) return false;
 
-    // ✅ 新增：强制 flush + finish，确保拷贝真正完成并同步 driver
-    err = clFinish(context_->get_queue());
-    if (!context_->check_error(err, "clFinish(after H2D)")) return false;
-
     return true;
 }
 
@@ -231,10 +226,18 @@ bool OpenCLMemoryPool::copy_device_to_host(void* dst, cl_mem src, size_t size, s
 }
 
 
-bool OpenCLMemoryPool::copy_device_to_device(cl_mem dst, cl_mem src, size_t size) {
+bool OpenCLMemoryPool::copy_device_to_device(
+    cl_mem dst,
+    cl_mem src,
+    size_t size,
+    size_t dst_offset,
+    size_t src_offset) {
     if (!dst || !src) {
         POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_device");
         return false;
+    }
+    if (size == 0) {
+        return true;
     }
 
     size_t src_size = 0, dst_size = 0;
@@ -247,15 +250,15 @@ bool OpenCLMemoryPool::copy_device_to_device(cl_mem dst, cl_mem src, size_t size
         return false;
     }
 
-    if (size > src_size || size > dst_size) {
-        POWERSERVE_LOG_ERROR("D2D OOB: size={} src_size={} dst_size={}",
-                             size, src_size, dst_size);
+    if (src_offset + size > src_size || dst_offset + size > dst_size) {
+        POWERSERVE_LOG_ERROR("D2D OOB: src_off={} dst_off={} size={} src_size={} dst_size={}",
+                             src_offset, dst_offset, size, src_size, dst_size);
         return false;
     }
 
 
     cl_int err = clEnqueueCopyBuffer(context_->get_queue(), src, dst,
-                                     0, 0, size, 0, nullptr, nullptr);
+                                     src_offset, dst_offset, size, 0, nullptr, nullptr);
     return context_->check_error(err, "clEnqueueCopyBuffer");
 }
 

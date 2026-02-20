@@ -4,7 +4,6 @@
 #include "core/logger.hpp"
 #include "ggml.h"
 
-#include <iostream>
 #include <mutex>
 
 namespace powerserve::opencl {
@@ -32,26 +31,17 @@ OpenCLBackend::~OpenCLBackend() {
 
 void OpenCLBackend::cleanup() {
     if (!initialized) return;
-
-    std::cout << "[DEBUG] === CLEANUP TEST VERSION ===" << std::endl;
-
-    std::cout << "[DEBUG] 1. Cleaning OpenCL context first..." << std::endl;
     clear_quant_cache();
+    {
+        std::lock_guard<std::mutex> lock(m_resident_buffers_mutex);
+        m_resident_buffers.clear();
+    }
     if (context) {
         context.reset();
-        std::cout << "[DEBUG] Context released" << std::endl;
     }
 
-    std::cout << "[DEBUG] 2. Cleaning memory pool..." << std::endl;
     if (memory_pool) {
         memory_pool.reset();
-        std::cout << "[DEBUG] Memory pool released" << std::endl;
-    }
-
-    std::cout << "[DEBUG] 3. Now cleaning thread pool..." << std::endl;
-    if (thread_pool) {
-        thread_pool.reset();
-        std::cout << "[DEBUG] Thread pool released" << std::endl;
     }
 
     m_ggml_fallback.reset();
@@ -60,7 +50,6 @@ void OpenCLBackend::cleanup() {
     m_tokens_capacity = 0;
 
     initialized = false;
-    std::cout << "[DEBUG] === CLEANUP DONE ===" << std::endl;
 }
 
 void OpenCLBackend::ensure_tokens_buffer(size_t token_count) const {
@@ -179,6 +168,54 @@ std::shared_ptr<OpenCLBuffer> OpenCLBackend::create_buffer(Shape shape, DataType
                                static_cast<int>(dtype));
             return nullptr;
     }
+}
+
+std::shared_ptr<OpenCLBuffer> OpenCLBackend::get_or_create_resident_buffer(const Tensor *src) const {
+    if (!src || !src->m_data) {
+        return nullptr;
+    }
+
+    auto *src_cpu = dynamic_cast<CPUBuffer *>(src->m_data.get());
+    if (!src_cpu) {
+        auto *src_cl = dynamic_cast<OpenCLBuffer *>(src->m_data.get());
+        if (!src_cl) {
+            return nullptr;
+        }
+        return std::shared_ptr<OpenCLBuffer>(src->m_data, src_cl);
+    }
+
+    ResidentBufferKey key;
+    key.host_buf = src->m_data.get();
+    key.dtype = src->m_dtype;
+    key.shape = src->m_shape;
+    key.stride = src_cpu->m_stride;
+
+    {
+        std::lock_guard<std::mutex> lock(m_resident_buffers_mutex);
+        auto it = m_resident_buffers.find(key);
+        if (it != m_resident_buffers.end()) {
+            return it->second;
+        }
+    }
+
+    auto uploaded = create_buffer(src->m_shape, src->m_dtype);
+    if (!uploaded) {
+        return nullptr;
+    }
+
+    Tensor tmp_dst(src->m_dtype, src->m_shape);
+    tmp_dst.m_data = std::static_pointer_cast<BaseBuffer>(uploaded);
+    this->copy(&tmp_dst, src);
+
+    {
+        std::lock_guard<std::mutex> lock(m_resident_buffers_mutex);
+        auto [it, inserted] = m_resident_buffers.emplace(key, uploaded);
+        if (!inserted) {
+            return it->second;
+        }
+    }
+
+    return uploaded;
 }
 
 
