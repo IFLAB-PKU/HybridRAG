@@ -175,29 +175,15 @@ auto Qwen3Model::compute_embedding(const std::vector<Token> &tokens, size_t batc
 #if defined(POWERSERVE_WITH_QNN)
         if (m_platform->qnn_backend) {
             auto size = llm_config.dim;
-            bool use_qnn_lm_head = m_platform->qnn_backend->m_models[m_config->model_id]->m_config.lm_heads.size() > 0;
-            
-            if (use_qnn_lm_head) {
-                size   = llm_config.vocab_size;
-                x = g.qnn_forward(x, batch_pos, mask, size, false /* lm_head */);
-            }else{
-                // 调用 qnn_forward
-                // 注意：这里假设 qnn_forward 能正确处理 lm_head=false 的情况并返回 hidden states
-                x = g.qnn_forward(x, batch_pos, mask, size, false /* lm_head */);
+            x=g.qnn_forward(x, batch_pos, mask, size, true /* lm_head=false */); 
+            // [NOTE]: `lm_head=true` in order to satisfy qnn_forward's output size. Indeed we do not use lm_head.bin to compute logits. We want hidden states.
 
-                // 如果是最后一批，且 QNN 输出的已经是 hidden state，
-                // 我们可能还需要手动加上 Final RMS Norm，除非 QNN 模型内部已经包含了它。
-                // 通常 QNN 模型导出时会包含所有层，但不一定包含最后的 Norm。
-                // 参考 forward 中的逻辑：
-                // 对于 Embedding，我们需要 Final RMS Norm。
-                // 如果 QNN Graph 仅仅是 Transformer Layers 的堆叠，我们需要在这里补上 Norm。
-                if (is_last_batch) {
-                    auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
-                    auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
-                    x                   = final_rms_norm;
-                }
+                
+            if (is_last_batch) {
+                auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
+                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+                x                   = final_rms_norm;
             }
-            
         } else
 #endif
         if(!lazy_load){
