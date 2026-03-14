@@ -97,6 +97,10 @@ struct ModelInput {
 
     float m_repeat_penalty;
 
+    /* Rerank Extension */
+    std::vector<std::string> m_documents; // lsh add for rerank
+    size_t m_top_n;                       
+
     /* Metadata */
 
     size_t request_id;
@@ -104,9 +108,15 @@ struct ModelInput {
     // unsupported: logit_bias
 };
 
+struct RerankResult {
+    size_t index;
+    float score;
+};
+
 struct ModelOutput {
     std::string m_text;
     std::vector<float> m_embedding; // lsh add for embedding
+    std::vector<RerankResult> m_rerank_results; // lsh add for rerank
     size_t m_input_num_token;
     size_t m_output_num_token;
     std::optional<std::string> m_stop_reason;
@@ -760,6 +770,65 @@ inline ModelOutput blocking_embedding(
 
 }
 
+inline ModelOutput blocking_rerank(
+    const ModelContext &context, const ModelInput &input
+) {
+    using namespace powerserve;
+
+    auto &config      = context.m_config;
+    auto &model       = *context.m_model_ptr;
+    auto &tokenizer   = *context.m_tokenizer_ptr;
+
+    ModelOutput output;
+    const size_t batch_size = config.hyper_params.batch_size;
+    output.m_input_num_token = 0;
+    
+    const std::string& query = input.m_prompt;
+    const std::vector<std::string>& documents = input.m_documents;
+    
+    std::vector<RerankResult> all_results;
+    all_results.reserve(documents.size());
+
+    POWERSERVE_LOG_INFO("Rerank task: query='{}', docs_count={}", abbreviation(query, 20), documents.size());
+    Timer timer;
+    
+    
+    for (size_t i = 0; i < documents.size(); ++i) {
+        const std::string& doc = documents[i];
+
+        // 1. Make Prompt according to template
+        std::string prompt = tokenizer.apply_rerank_template(query, doc);  
+
+        // 2. Tokenize
+        std::vector<powerserve::Token> tokens = tokenizer.tokenize(prompt, false);
+        
+        float score = model.compute_rerank_score(tokens, batch_size);
+        
+        output.m_input_num_token += tokens.size();
+        all_results.push_back({i, score});
+    }
+
+     // 4. Sort Descending
+     std::sort(all_results.begin(), all_results.end(), [](const RerankResult& a, const RerankResult& b) {
+        return a.score > b.score;
+    });
+
+    // 5. Top N Truncate
+    if (input.m_top_n < all_results.size()) {
+        all_results.resize(input.m_top_n);
+    }
+    
+    output.m_rerank_results = std::move(all_results);
+    output.m_output_num_token = 0;
+    
+    const size_t latency_ms = timer.elapsed_time_ms();
+    POWERSERVE_LOG_INFO("Rerank finished: {} docs processed in {}ms", documents.size(), latency_ms);
+
+
+    return output;
+}
+
+
 /*!
  * @brief Generate
  * @param[inout] context
@@ -811,6 +880,12 @@ inline ModelOutput embedding(ServerContext &server_context, const ModelInput &in
     const ModelContext &context = server_context.setup_model(input.m_model);
     const std::string input_prompt = input.m_prompt;
     return blocking_embedding(context, input, input_prompt);
+}
+
+inline ModelOutput rerank(ServerContext &server_context, const ModelInput &input) {
+    using namespace powerserve;
+    const ModelContext &context = server_context.setup_model(input.m_model);
+    return blocking_rerank(context, input);
 }
 
 inline std::vector<std::string> list_models(ServerContext &server_context) {
